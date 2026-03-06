@@ -23,7 +23,7 @@ from email.header import decode_header, make_header
 from email.parser import Parser
 import csv
 import argparse
-import time, random, json, os, re, subprocess, quopri, requests, shutil, base64
+import time, random, json, os, re, subprocess, quopri, requests, shutil, base64, hashlib
 try:
     import msvcrt
 except ImportError:
@@ -974,6 +974,86 @@ def _apply_driver_download_proxy(runtime_proxy):
         log(f"已设置驱动下载代理: {proxy}")
 
 
+def _prepare_chrome_proxy_runtime(proxy_value):
+    proxy = _normalize_proxy_value(proxy_value)
+    if not proxy:
+        return "", ""
+    try:
+        parsed = urlparse(proxy)
+        scheme = str(parsed.scheme or "http").strip().lower()
+        host = str(parsed.hostname or "").strip()
+        port = int(parsed.port or 0)
+        username = parsed.username or ""
+        password = parsed.password or ""
+    except Exception:
+        return proxy, ""
+
+    if not host or port <= 0:
+        return proxy, ""
+    if not username:
+        return proxy, ""
+
+    if scheme not in {"http", "https", "socks4", "socks5"}:
+        log(f"代理协议不支持自动鉴权扩展，将按原代理参数尝试: {scheme}", "WARN")
+        return proxy, ""
+
+    proxy_no_auth = f"{scheme}://{host}:{port}"
+    try:
+        ext_root = os.path.join(BASE_DIR, ".runtime_proxy_ext")
+        os.makedirs(ext_root, exist_ok=True)
+        key = f"{scheme}|{host}|{port}|{username}|{password}"
+        ext_id = hashlib.sha1(key.encode("utf-8")).hexdigest()[:16]
+        ext_dir = os.path.join(ext_root, ext_id)
+        os.makedirs(ext_dir, exist_ok=True)
+
+        manifest = {
+            "name": "Runtime Proxy Auth",
+            "version": "1.0.0",
+            "manifest_version": 3,
+            "permissions": ["proxy", "storage", "webRequest", "webRequestAuthProvider"],
+            "host_permissions": ["<all_urls>"],
+            "background": {"service_worker": "background.js"},
+        }
+        with open(os.path.join(ext_dir, "manifest.json"), "w", encoding="utf-8") as f:
+            json.dump(manifest, f, ensure_ascii=False, indent=2)
+
+        bg_js = f"""
+const config = {{
+  mode: "fixed_servers",
+  rules: {{
+    singleProxy: {{
+      scheme: {json.dumps(scheme)},
+      host: {json.dumps(host)},
+      port: {port}
+    }},
+    bypassList: ["localhost", "127.0.0.1", "::1"]
+  }}
+}};
+
+chrome.proxy.settings.set({{ value: config, scope: "regular" }}, function() {{}});
+
+chrome.webRequest.onAuthRequired.addListener(
+  function(details, callback) {{
+    callback({{
+      authCredentials: {{
+        username: {json.dumps(username)},
+        password: {json.dumps(password)}
+      }}
+    }});
+  }},
+  {{ urls: ["<all_urls>"] }},
+  ["asyncBlocking"]
+);
+""".strip()
+        with open(os.path.join(ext_dir, "background.js"), "w", encoding="utf-8") as f:
+            f.write(bg_js + "\n")
+
+        return proxy_no_auth, ext_dir
+    except Exception as e:
+        log(f"生成代理鉴权扩展失败，将按原代理参数尝试: {e}", "WARN")
+        return proxy, ""
+
+
 def _get_driver_major_version(driver_path):
     if not os.path.exists(driver_path):
         log(f"缓存驱动不存在: {driver_path}")
@@ -1030,10 +1110,16 @@ def create_browser_driver():
     options = uc.ChromeOptions()
     options.binary_location = CHROME_BINARY_PATH
     runtime_proxy = _get_runtime_proxy()
+    proxy_for_browser = runtime_proxy
+    proxy_ext_dir = ""
     if runtime_proxy:
-        options.add_argument(f"--proxy-server={runtime_proxy}")
+        proxy_for_browser, proxy_ext_dir = _prepare_chrome_proxy_runtime(runtime_proxy)
+        options.add_argument(f"--proxy-server={proxy_for_browser}")
         options.add_argument("--proxy-bypass-list=<-loopback>")
-        log(f"Browser proxy: {runtime_proxy}")
+        if proxy_ext_dir:
+            options.add_argument(f"--load-extension={proxy_ext_dir}")
+            log(f"已启用代理鉴权扩展: {proxy_ext_dir}")
+        log(f"Browser proxy: {_mask_proxy_for_log(runtime_proxy)}")
     runtime_strategy = str(os.getenv("PROXY_STRATEGY", "") or "").strip()
     runtime_upstream = _normalize_proxy_value(os.getenv("PROXY_UPSTREAM", ""))
     runtime_region = str(os.getenv("PROXY_REGION", "") or "").strip()
