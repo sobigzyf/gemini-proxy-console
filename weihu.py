@@ -193,6 +193,7 @@ def _is_retryable_proxy_runtime_error(exc, driver=None):
         "email input verify failed",
         "email input locate/click failed",
         "continue button click failed",
+        "proxy auth prompt detected",
     )
     if any(k in text for k in retryable_keywords):
         return True
@@ -1845,6 +1846,13 @@ def _open_login_and_submit_email(driver, wait, email):
         page_source = str(driver.page_source or "")
     except Exception:
         page_source = ""
+    page_hint = page_source.lower()
+    if (
+        "proxy" in page_hint and "authentication" in page_hint
+    ) or ("要求提供用户名和密码" in page_source):
+        raise RuntimeError(
+            f"proxy auth prompt detected ({_login_page_diag(driver)})"
+        )
     if "about:blank" in current_url.lower() or "chrome-error://" in current_url.lower() or len(page_source) < 500:
         raise RuntimeError(
             f"login page blank/incomplete ({_login_page_diag(driver)})"
