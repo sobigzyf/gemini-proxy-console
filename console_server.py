@@ -1890,6 +1890,8 @@ class RuntimeManager:
         summary_fail = 0
         has_summary = False
         return_code = -1
+        task_success = 0
+        task_fail = 0
 
         eof_sentinel = object()
 
@@ -1903,16 +1905,17 @@ class RuntimeManager:
                 run_env["EASYPROXIES_API_URL"] = easyproxies_api_url
             # Keep scripts from trying old socks5-pool switching paths.
             if run_strategy == "easyproxies":
-                # Keep one in-process retry for transient browser/proxy hiccups.
-                run_env["MAIL_PROXY_ROTATE_RETRIES"] = "1"
+                # EasyProxies mode rotates from manager; disable legacy in-script switch.
+                run_env["MAIL_PROXY_ROTATE_RETRIES"] = "0"
                 run_env["MAIL_PROXY_SWITCH_ATTEMPTS"] = "0"
                 run_env["MAIL_PROXY_SWITCH_VALIDATE"] = "0"
+                run_env["MAIL_TIMEOUT_PROXY_ROTATE"] = "0"
             else:
                 run_env.setdefault("MAIL_PROXY_ROTATE_RETRIES", "2")
                 run_env.setdefault("MAIL_PROXY_SWITCH_ATTEMPTS", "3")
                 run_env.setdefault("MAIL_PROXY_SWITCH_VALIDATE", "1")
+                run_env.setdefault("MAIL_TIMEOUT_PROXY_ROTATE", "1")
             run_env.setdefault("MAIL_PROXY_ROTATE_THRESHOLD", "2")
-            run_env.setdefault("MAIL_TIMEOUT_PROXY_ROTATE", "1")
             run_env.setdefault("MAIL_PROXY_SWITCH_VALIDATE_TIMEOUT", "6")
             run_env.setdefault("BROWSER_PROXY_PRECHECK_RETRIES", "3")
             run_env.setdefault("BROWSER_PROXY_PRECHECK_TIMEOUT", "6")
@@ -2146,6 +2149,8 @@ class RuntimeManager:
             if kind == "register":
                 final_success = summary_success if has_summary else progress_success
                 final_fail = summary_fail if has_summary else progress_fail
+                task_success = final_success
+                task_fail = final_fail
 
                 if (stalled or proxy_fail_guard_triggered) and (progress_success > 0 or progress_fail > 0):
                     with self._lock:
@@ -2203,6 +2208,8 @@ class RuntimeManager:
                     self.error(f"Register task exited abnormally, code={return_code}", step="register")
             else:
                 maintain_processed = max(progress_done, progress_success + progress_fail)
+                task_success = max(0, int(progress_success or 0))
+                task_fail = max(0, int(progress_fail or 0))
                 if return_code == 0:
                     with self._lock:
                         self._maintain_watchdog_restarts = 0
@@ -2364,6 +2371,30 @@ class RuntimeManager:
                             f"pause={restart_delay_seconds}s",
                             step="maintain",
                         )
+
+            if restart_requested and auto_triggered and proxy_related_error_seen and task_success <= 0:
+                if kind == "register":
+                    cooldown_seconds = max(
+                        900,
+                        int(float(cfg.get("auto_register_interval_hours") or 4.0) * 3600),
+                    )
+                    with self._lock:
+                        self.next_auto_register_at = time.time() + cooldown_seconds
+                else:
+                    maintain_interval_hours = float(cfg.get("maintain_interval_hours") or 0.0)
+                    if maintain_interval_hours > 0:
+                        cooldown_seconds = max(900, int(maintain_interval_hours * 3600))
+                    else:
+                        cooldown_seconds = max(900, int(cfg.get("maintain_interval_minutes") or 30) * 60)
+                    with self._lock:
+                        self.next_auto_maintain_at = time.time() + cooldown_seconds
+                restart_requested = False
+                restart_delay_seconds = 0
+                self.warn(
+                    f"Auto restart suppressed for {kind}: success=0 fail={task_fail}, "
+                    f"cooldown={cooldown_seconds}s",
+                    step=kind,
+                )
 
             if not restart_requested:
                 # Refresh all_account.json after each register/maintain run
