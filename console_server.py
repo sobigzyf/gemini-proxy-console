@@ -1903,7 +1903,8 @@ class RuntimeManager:
                 run_env["EASYPROXIES_API_URL"] = easyproxies_api_url
             # Keep scripts from trying old socks5-pool switching paths.
             if run_strategy == "easyproxies":
-                run_env["MAIL_PROXY_ROTATE_RETRIES"] = "0"
+                # Keep one in-process retry for transient browser/proxy hiccups.
+                run_env["MAIL_PROXY_ROTATE_RETRIES"] = "1"
                 run_env["MAIL_PROXY_SWITCH_ATTEMPTS"] = "0"
                 run_env["MAIL_PROXY_SWITCH_VALIDATE"] = "0"
             else:
@@ -2171,12 +2172,31 @@ class RuntimeManager:
                         remaining_after_success > 0
                         and run_strategy == "easyproxies"
                         and bool(cfg.get("easyproxies_node_rotation_enabled", True))
+                        and final_success > 0
                     ):
                         restart_requested = True
                         restart_target = max(1, int(remaining_after_success))
                         self.info(
                             "Register segmented continuation: "
                             f"segment_done={target_count}, remaining={restart_target}",
+                            step="register",
+                        )
+                    elif remaining_after_success > 0 and final_success <= 0:
+                        self.warn(
+                            "Register segmented continuation paused: "
+                            "current segment has zero success, avoiding useless retries",
+                            step="register",
+                        )
+                    if auto_triggered and final_success <= 0 and final_fail > 0:
+                        cooldown_seconds = max(
+                            600,
+                            int(float(cfg.get("auto_register_interval_hours") or 4.0) * 3600),
+                        )
+                        with self._lock:
+                            self.next_auto_register_at = time.time() + cooldown_seconds
+                        self.warn(
+                            "Auto register cooldown enabled: "
+                            f"success=0 fail={final_fail}, next retry in {cooldown_seconds}s",
                             step="register",
                         )
                 else:

@@ -197,6 +197,8 @@ def _is_retryable_proxy_runtime_error(exc, driver=None):
         "blank/incomplete",
         "login page blank",
         "email input verify failed",
+        "email input locate/click failed",
+        "continue button click failed",
     )
     if any(k in text for k in retryable_keywords):
         return True
@@ -335,29 +337,35 @@ def _probe_runtime_proxy(runtime_proxy, timeout_seconds=8):
         return True, "", "", ""
     timeout = max(3, int(timeout_seconds))
     targets = (
-        ("https://cloudflare.com/cdn-cgi/trace", True),
-        ("https://www.google.com/generate_204", False),
+        ("https://cloudflare.com/cdn-cgi/trace", "trace"),
+        ("https://www.google.com/generate_204", "status"),
+        ("https://accounts.google.com", "status"),
+        ("https://auth.business.gemini.google/login", "status"),
     )
     errors = []
-    for url, parse_trace in targets:
+    for url, mode in targets:
         try:
             resp = requests.get(
                 url,
                 headers={"User-Agent": "GeminiRegister/1.0"},
                 proxies={"http": proxy, "https": proxy},
                 timeout=timeout,
+                allow_redirects=False,
             )
-            if resp.status_code >= 400:
+            status = int(resp.status_code or 0)
+            if status >= 400:
                 errors.append(f"{url} -> HTTP {resp.status_code}")
                 continue
-            if parse_trace:
+            if mode == "trace":
                 text = resp.text or ""
                 loc_m = re.search(r"(?m)^loc=(.+)$", text)
                 ip_m = re.search(r"(?m)^ip=(.+)$", text)
                 loc = str(loc_m.group(1)).strip() if loc_m else ""
                 ip = str(ip_m.group(1)).strip() if ip_m else ""
                 return True, loc, ip, ""
-            return True, "", "", ""
+            if mode == "status" and status in {200, 204, 301, 302, 303, 307, 308}:
+                return True, "", "", ""
+            errors.append(f"{url} -> unexpected HTTP {status}")
         except Exception as exc:
             errors.append(f"{url} -> {exc}")
     return False, "", "", "; ".join(errors)[:500]
@@ -368,8 +376,9 @@ def _ensure_runtime_proxy_ready_for_browser():
     if not runtime_proxy:
         return
     runtime_strategy = str(os.getenv("PROXY_STRATEGY", "") or "").strip().lower()
-    if runtime_strategy != "socks5_pool":
+    if runtime_strategy not in {"socks5_pool", "easyproxies"}:
         return
+    allow_active_switch = runtime_strategy == "socks5_pool"
 
     precheck_retries = _env_int("BROWSER_PROXY_PRECHECK_RETRIES", 2, 1, 6)
     precheck_timeout = _env_int("BROWSER_PROXY_PRECHECK_TIMEOUT", 8, 3, 20)
@@ -385,17 +394,24 @@ def _ensure_runtime_proxy_ready_for_browser():
             return
 
         last_err = err or "unknown"
-        switched, switch_detail = _switch_proxy_once()
-        if switched:
-            log(
-                "Browser proxy precheck failed, switched socks5 upstream and retrying: "
-                f"attempt={attempt}/{precheck_retries}, {switch_detail}; err={last_err}",
-                "WARN",
-            )
+        if allow_active_switch:
+            switched, switch_detail = _switch_proxy_once()
+            if switched:
+                log(
+                    "Browser proxy precheck failed, switched socks5 upstream and retrying: "
+                    f"attempt={attempt}/{precheck_retries}, {switch_detail}; err={last_err}",
+                    "WARN",
+                )
+            else:
+                log(
+                    "Browser proxy precheck failed: "
+                    f"attempt={attempt}/{precheck_retries}, err={last_err}, switch={switch_detail}",
+                    "WARN",
+                )
         else:
             log(
-                "Browser proxy precheck failed: "
-                f"attempt={attempt}/{precheck_retries}, err={last_err}, switch={switch_detail}",
+                "Browser proxy precheck failed (easyproxies, no local switch): "
+                f"attempt={attempt}/{precheck_retries}, err={last_err}",
                 "WARN",
             )
 
@@ -1475,24 +1491,109 @@ def _wait_clickable(driver, by, locator, timeout=30):
     raise RuntimeError(f"element not clickable: {locator}; err={last_err or 'timeout'}")
 
 
+def _wait_clickable_any(driver, locators, timeout=30):
+    end_at = time.time() + max(1, int(timeout))
+    last_err = ""
+    while time.time() < end_at:
+        for by, locator in locators:
+            try:
+                elements = driver.find_elements(by, locator)
+            except Exception as exc:
+                last_err = f"{locator}: {exc}"
+                continue
+            for el in elements:
+                if el is None:
+                    continue
+                try:
+                    if el.is_displayed() and el.is_enabled():
+                        return el
+                except Exception as exc:
+                    last_err = f"{locator}: {exc}"
+        time.sleep(0.2)
+    raise RuntimeError(f"no clickable element matched; err={last_err or 'timeout'}")
+
+
+def _login_page_diag(driver):
+    try:
+        url = str(getattr(driver, "current_url", "") or "")
+    except Exception:
+        url = ""
+    try:
+        title = str(getattr(driver, "title", "") or "")
+    except Exception:
+        title = ""
+    try:
+        html = str(driver.page_source or "")
+    except Exception:
+        html = ""
+    err_mark = ""
+    m = re.search(r"ERR_[A-Z_]+", html)
+    if m:
+        err_mark = m.group(0)
+    return f"url={url or '-'}, title={title or '-'}, html={len(html)}, err={err_mark or '-'}"
+
+
+def _try_dismiss_login_overlays(driver):
+    # Best-effort: GDPR/cookie dialogs sometimes block email input click.
+    button_locators = (
+        (By.XPATH, "//button[.//span[contains(.,'Accept all')] or contains(.,'Accept all')]"),
+        (By.XPATH, "//button[.//span[contains(.,'I agree')] or contains(.,'I agree')]"),
+        (By.XPATH, "//button[contains(.,'全部接受') or contains(.,'接受全部') or contains(.,'同意')]"),
+    )
+    for by, locator in button_locators:
+        try:
+            elements = driver.find_elements(by, locator)
+        except Exception:
+            continue
+        for el in elements:
+            try:
+                if el.is_displayed() and el.is_enabled():
+                    driver.execute_script("arguments[0].click();", el)
+                    time.sleep(0.2)
+                    log("检测到并点击了登录页遮罩按钮", "WARN")
+                    return
+            except Exception:
+                continue
+
+
 def _open_login_and_submit_email(driver, wait, email):
     driver.get(LOGIN_URL)
-    time.sleep(1.5)
+    time.sleep(1.0)
+    for _ in range(20):
+        try:
+            if str(driver.execute_script("return document.readyState") or "").lower() == "complete":
+                break
+        except Exception:
+            pass
+        time.sleep(0.2)
+
+    _try_dismiss_login_overlays(driver)
+
     current_url = str(getattr(driver, "current_url", "") or "")
     try:
         page_source = str(driver.page_source or "")
     except Exception:
         page_source = ""
-    if "about:blank" in current_url.lower() or len(page_source) < 500:
+    if "about:blank" in current_url.lower() or "chrome-error://" in current_url.lower() or len(page_source) < 500:
         raise RuntimeError(
-            f"login page blank/incomplete (url={current_url or 'unknown'}, html={len(page_source)})"
+            f"login page blank/incomplete ({_login_page_diag(driver)})"
         )
 
     log("输入邮箱...")
-    inp = _wait_clickable(driver, By.XPATH, XPATH["email_input"], timeout=30)
-    inp.click()
-    inp.clear()
-    fast_type(inp, email)
+    email_locators = (
+        (By.ID, "identifierId"),
+        (By.NAME, "identifier"),
+        (By.CSS_SELECTOR, "input[type='email']"),
+        (By.XPATH, "//input[contains(@aria-label,'Email') or contains(@aria-label,'邮箱') or contains(@aria-label,'phone')]"),
+        (By.XPATH, XPATH["email_input"]),
+    )
+    try:
+        inp = _wait_clickable_any(driver, email_locators, timeout=30)
+        inp.click()
+        inp.clear()
+        fast_type(inp, email)
+    except Exception as exc:
+        raise RuntimeError(f"email input locate/click failed: {exc}; diag={_login_page_diag(driver)}") from None
 
     typed_value = str(inp.get_attribute("value") or "").strip()
     if typed_value != email:
@@ -1518,8 +1619,17 @@ def _open_login_and_submit_email(driver, wait, email):
 
     log(f"邮箱: {email}")
     time.sleep(0.5)
-    btn = _wait_clickable(driver, By.XPATH, XPATH["continue_btn"], timeout=20)
-    driver.execute_script("arguments[0].click();", btn)
+    continue_locators = (
+        (By.ID, "identifierNext"),
+        (By.XPATH, "//div[@id='identifierNext']//button"),
+        (By.XPATH, "//button[.//span[contains(.,'Next') or contains(.,'下一步') or contains(.,'继续')]]"),
+        (By.XPATH, XPATH["continue_btn"]),
+    )
+    try:
+        btn = _wait_clickable_any(driver, continue_locators, timeout=20)
+        driver.execute_script("arguments[0].click();", btn)
+    except Exception as exc:
+        raise RuntimeError(f"continue button click failed: {exc}; diag={_login_page_diag(driver)}") from None
     log("点击继续")
 
 

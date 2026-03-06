@@ -18,6 +18,7 @@ mail_tokens.txt
 mailbox_tokens.json
 existing_accounts.json
 runtime_bundle*.tar.gz
+.runtime_proxy_ext/
 
 # Local vendor mirrors
 _vendor_easyproxiesv2/
