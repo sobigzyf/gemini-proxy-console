@@ -1,0 +1,29 @@
+﻿services:
+  gemini-console:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: gemini-console:local
+    container_name: gemini-console
+    restart: unless-stopped
+    network_mode: host
+    env_file:
+      - .env
+    environment:
+      TZ: Asia/Shanghai
+      CHROME_BIN: /usr/bin/chromium
+      UC_CLEAR_CACHE_ON_RETRY: "0"
+      UC_DOWNLOAD_PROXY_ENABLED: "0"
+      USE_XVFB: "1"
+      XVFB_WHD: 1920x1080x24
+    volumes:
+      - ./:/app
+      - uc-driver-cache:/root/.local/share/undetected_chromedriver
+      - chrome-cache:/root/.cache
+    # If host network is not available, switch to explicit port mapping:
+    # ports:
+    #   - "18423:18423"
+
+volumes:
+  uc-driver-cache:
+  chrome-cache:

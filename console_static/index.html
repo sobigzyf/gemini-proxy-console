@@ -1,0 +1,221 @@
+﻿<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Gemini 控制台</title>
+  <link rel="stylesheet" href="/static/style.css" />
+</head>
+<body>
+  <div class="bg-glow bg-glow-a"></div>
+  <div class="bg-glow bg-glow-b"></div>
+
+  <header class="topbar">
+    <div class="brand">
+      <h1>Gemini 控制台</h1>
+      <p>注册 / 维护 / 同步 / EasyProxies 订阅一体化</p>
+    </div>
+    <div id="headerStatus" class="badge idle">空闲</div>
+  </header>
+
+  <main>
+    <section class="card wide">
+      <h2>运行状态</h2>
+      <div class="grid status-grid">
+        <div><span class="label">补号状态</span><span id="registerStatus">idle</span></div>
+        <div><span class="label">维护状态</span><span id="maintainStatus">idle</span></div>
+        <div><span class="label">累计成功</span><span id="successCount">0</span></div>
+        <div><span class="label">累计失败</span><span id="failCount">0</span></div>
+        <div><span class="label">代理策略</span><span id="currentProxyStrategy">-</span></div>
+        <div><span class="label">浏览器代理</span><span id="currentProxy">-</span></div>
+        <div><span class="label">实际上游代理</span><span id="currentProxyUpstream">-</span></div>
+        <div><span class="label">上游地区</span><span id="currentProxyRegion">-</span></div>
+        <div><span class="label">补号重启次数</span><span id="watchdogRegisterRestarts">0</span></div>
+        <div><span class="label">维护重启次数</span><span id="watchdogMaintainRestarts">0</span></div>
+        <div><span class="label">本次目标</span><span id="targetCount">0</span></div>
+        <div><span class="label">同步状态</span><span id="syncStatus">idle</span></div>
+        <div><span class="label">最近同步</span><span id="lastSyncAt">-</span></div>
+        <div><span class="label">同步结果</span><span id="lastSyncResult">-</span></div>
+      </div>
+      <div class="actions">
+        <label>补号数量
+          <input id="startCount" type="number" min="1" value="1" />
+        </label>
+        <button id="startBtn" class="btn primary">启动补号</button>
+        <button id="stopBtn" class="btn danger">停止补号</button>
+        <button id="maintainBtn" class="btn">执行维护</button>
+        <button id="stopMaintainBtn" class="btn danger">停止维护</button>
+        <button id="stopAllBtn" class="btn danger">一键停止</button>
+        <button id="mergeBtn" class="btn">刷新 all_account</button>
+        <button id="syncNowBtn" class="btn">立即同步服务端</button>
+      </div>
+      <div id="actionMsg" class="hint"></div>
+    </section>
+
+    <section class="card">
+      <h2>账号池状态</h2>
+      <div class="grid pool-grid">
+        <div><span class="label">配置总数</span><span id="poolTotal">0</span></div>
+        <div><span class="label">有效</span><span id="poolValid">0</span></div>
+        <div><span class="label">未知</span><span id="poolUnknown">0</span></div>
+        <div><span class="label">过期</span><span id="poolExpired">0</span></div>
+        <div><span class="label">阈值</span><span id="poolThreshold">0</span></div>
+        <div><span class="label">缺口</span><span id="poolGap">0</span></div>
+      </div>
+    </section>
+
+    <section class="card">
+      <h2>EasyProxies 代理</h2>
+      <div class="grid config-grid">
+        <label>固定代理（兜底）
+          <input id="proxyInput" type="text" placeholder="http://127.0.0.1:7890" />
+        </label>
+        <label>EasyProxies 监听代理
+          <input id="easyProxiesListenProxy" type="text" placeholder="http://127.0.0.1:2323" />
+        </label>
+        <label>EasyProxies 管理地址
+          <input id="easyProxiesApiUrl" type="text" placeholder="http://127.0.0.1:7840" />
+        </label>
+        <label>EasyProxies 管理密码
+          <input id="easyProxiesPassword" type="password" placeholder="留空表示不修改" />
+        </label>
+        <label>订阅链接
+          <input id="easyProxiesSubscriptionUrl" type="text" placeholder="https://example.com/subscription" />
+        </label>
+        <label>订阅刷新间隔(分钟)
+          <input id="easyProxiesSubscriptionRefreshMinutes" type="number" min="1" max="1440" value="60" />
+        </label>
+      </div>
+      <div class="toggle-row">
+        <label><input id="easyProxiesEnabled" type="checkbox" /> 启用 EasyProxies 主代理</label>
+        <label><input id="easyProxiesSubscriptionEnabled" type="checkbox" /> 启用订阅同步</label>
+        <label><input id="easyProxiesRefreshBeforeTask" type="checkbox" /> 任务前同步订阅并刷新</label>
+        <label><input id="easyProxiesRetryForever" type="checkbox" /> 连通失败持续重试</label>
+        <label><input id="easyProxiesNodeRotationEnabled" type="checkbox" /> 启用按节点配额轮换</label>
+      </div>
+      <div class="grid config-grid">
+        <label>EasyProxies 重试次数
+          <input id="easyProxiesRetryTimes" type="number" min="1" max="60" value="3" />
+        </label>
+        <label>EasyProxies 重试间隔(秒)
+          <input id="easyProxiesRetryIntervalSeconds" type="number" min="1" max="300" value="8" />
+        </label>
+        <label>运行中订阅刷新间隔(秒,0=关闭)
+          <input id="easyProxiesRotateIntervalSeconds" type="number" min="0" max="3600" value="120" />
+        </label>
+        <label>每节点补号配额
+          <input id="easyProxiesNodeRegisterQuota" type="number" min="1" max="500" value="5" />
+        </label>
+        <label>每节点维护配额
+          <input id="easyProxiesNodeMaintainQuota" type="number" min="1" max="5000" value="20" />
+        </label>
+      </div>
+      <div class="actions">
+        <button id="saveConfigBtn" class="btn primary">保存配置</button>
+        <button id="testProxyBtn" class="btn">测试固定代理</button>
+        <button id="testEasyProxiesBtn" class="btn">测试 EasyProxies</button>
+        <button id="syncEasyProxiesSubBtn" class="btn">同步订阅到 EasyProxies</button>
+        <button id="monitorProxyBtn" class="btn">代理监测</button>
+      </div>
+      <div id="configMsg" class="hint"></div>
+    </section>
+
+    <section class="card">
+      <h2>任务与同步配置</h2>
+      <div class="toggle-row">
+        <label><input id="autoMaintain" type="checkbox" /> 自动维护</label>
+        <label><input id="autoRegister" type="checkbox" /> 自动补号</label>
+        <label><input id="guaranteeEnabled" type="checkbox" /> 启用 4 小时可用保障</label>
+        <label><input id="syncEnabled" type="checkbox" /> 启用服务端同步</label>
+        <label><input id="syncAfterRegister" type="checkbox" /> 补号后自动同步</label>
+        <label><input id="syncAfterMaintain" type="checkbox" /> 维护后自动同步</label>
+        <label><input id="taskWatchdogEnabled" type="checkbox" /> 启用任务卡顿监控</label>
+        <label><input id="taskStallRestartEnabled" type="checkbox" /> 卡顿自动重启续跑</label>
+        <label><input id="proxyFailGuardEnabled" type="checkbox" /> 启用代理失败熔断重启</label>
+      </div>
+      <div class="grid config-grid">
+        <label>任务优先级
+          <select id="autoTaskPriority">
+            <option value="maintain">维护优先</option>
+            <option value="register">补号优先</option>
+          </select>
+        </label>
+        <label>维护间隔(分钟)
+          <input id="maintainInterval" type="number" min="5" value="30" />
+        </label>
+        <label>维护间隔(小时)
+          <input id="maintainIntervalHours" type="number" min="0.1" max="72" step="0.1" value="4" />
+        </label>
+        <label>补号间隔(小时)
+          <input id="autoRegisterIntervalHours" type="number" min="0.1" max="72" step="0.1" value="4" />
+        </label>
+        <label>每次补号数量
+          <input id="autoRegisterBatchSize" type="number" min="1" max="500" value="20" />
+        </label>
+        <label>保障目标账号数
+          <input id="guaranteeTargetAccounts" type="number" min="1" max="10000" value="200" />
+        </label>
+        <label>保障时间窗口(小时)
+          <input id="guaranteeWindowHours" type="number" min="0.5" max="24" step="0.5" value="4" />
+        </label>
+        <label>账号池阈值(min_accounts)
+          <input id="minAccounts" type="number" min="1" value="20" />
+        </label>
+        <label>默认补号数量
+          <input id="registerDefaultCount" type="number" min="1" value="1" />
+        </label>
+        <label>同步地址(目标 `PUT /admin/accounts-config`)
+          <input id="syncUrl" type="text" placeholder="http://127.0.0.1:7860/admin/accounts-config" />
+        </label>
+        <label>同步认证模式
+          <select id="syncAuthMode">
+            <option value="session">session (推荐)</option>
+            <option value="bearer">bearer</option>
+            <option value="header">header</option>
+            <option value="query">query</option>
+            <option value="none">none</option>
+          </select>
+        </label>
+        <label>登录地址(可选, session)
+          <input id="syncLoginUrl" type="text" placeholder="留空自动推导 /login" />
+        </label>
+        <label>服务端管理密钥
+          <input id="syncApiKey" type="password" placeholder="留空表示不修改" />
+        </label>
+        <label>认证 Header 名称
+          <input id="syncAuthHeaderName" type="text" value="X-API-Key" />
+        </label>
+        <label>认证 Query 参数名
+          <input id="syncAuthQueryName" type="text" value="api_key" />
+        </label>
+        <label>同步超时(秒)
+          <input id="syncTimeoutSeconds" type="number" min="5" max="120" value="20" />
+        </label>
+        <label>卡顿判定秒数
+          <input id="taskStallTimeoutSeconds" type="number" min="30" max="7200" value="300" />
+        </label>
+        <label>卡顿重启最大次数(0=不限)
+          <input id="taskStallRestartMax" type="number" min="0" max="50" value="5" />
+        </label>
+        <label>代理失败连续阈值
+          <input id="proxyFailGuardThreshold" type="number" min="2" max="20" value="3" />
+        </label>
+        <label>代理失败暂停秒数
+          <input id="proxyFailGuardPauseSeconds" type="number" min="10" max="900" value="60" />
+        </label>
+      </div>
+      <div class="hint">
+        补号数量逻辑：顶部“补号数量”=手动任务总量；“默认补号数量”=仅用于回填顶部输入框；“每次补号数量”=自动补号单次总量。
+        启用节点配额轮换后，会按“每节点补号配额 / 每节点维护配额”自动切分并切换节点，直到该任务总量或待维护账号处理完成。
+      </div>
+    </section>
+
+    <section class="card wide">
+      <h2>实时日志</h2>
+      <div id="logs" class="logs"></div>
+    </section>
+  </main>
+
+  <script src="/static/app.js"></script>
+</body>
+</html>

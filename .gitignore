@@ -1,0 +1,24 @@
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Logs
+*.log
+tmp_*.log
+console_*.log
+
+# Local env/runtime data
+.env
+gemini_accounts/
+console_config.json
+console_state.json
+maintenance_status.json
+mail_tokens.txt
+mailbox_tokens.json
+existing_accounts.json
+runtime_bundle*.tar.gz
+
+# Local vendor mirrors
+_vendor_easyproxiesv2/
+_vendor_socks5_proxy/
