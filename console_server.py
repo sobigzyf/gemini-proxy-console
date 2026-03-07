@@ -28,16 +28,9 @@ except Exception:
     yaml = None
 
 from proxy_pool import (
-    DEFAULT_POOL_API_URL,
-    DEFAULT_POOL_AUTH_MODE,
-    DEFAULT_POOL_COUNTRY,
-    DEFAULT_POOL_COUNT,
-    fetch_proxy_from_pool,
     is_location_supported,
     normalize_proxy_value,
     parse_trace,
-    pool_relay_url_from_fetch_url,
-    trace_via_pool_relay,
     trace_via_proxy,
 )
 
@@ -55,6 +48,7 @@ STATIC_DIR.mkdir(exist_ok=True)
 
 DEFAULT_CONFIG: Dict[str, Any] = {
     "proxy": "",
+    "proxy_engine": str(os.getenv("PROXY_ENGINE", "easyproxies") or "easyproxies").strip().lower() or "easyproxies",
     "easyproxies_enabled": True,
     "easyproxies_listen_proxy": "http://127.0.0.1:2323",
     "easyproxies_api_url": "http://127.0.0.1:7840",
@@ -70,16 +64,21 @@ DEFAULT_CONFIG: Dict[str, Any] = {
     "easyproxies_node_rotation_enabled": True,
     "easyproxies_node_register_quota": 5,
     "easyproxies_node_maintain_quota": 20,
-    "proxy_pool_enabled": True,
-    "proxy_pool_api_url": DEFAULT_POOL_API_URL,
-    "proxy_pool_auth_mode": DEFAULT_POOL_AUTH_MODE,
-    "proxy_pool_api_key": "",
-    "proxy_pool_count": DEFAULT_POOL_COUNT,
-    "proxy_pool_country": DEFAULT_POOL_COUNTRY,
-    "proxy_pool_retry_times": 3,
-    "proxy_subscription_enabled": False,
-    "proxy_subscription_url": "",
-    "proxy_subscription_refresh_minutes": 10,
+    "easyproxies_fixed_node": "",
+    "resin_enabled": str(os.getenv("RESIN_ENABLED", "0") or "0").strip().lower() in {"1", "true", "yes", "on"},
+    "resin_api_url": str(os.getenv("RESIN_API_URL", "http://127.0.0.1:2260") or "http://127.0.0.1:2260").strip(),
+    "resin_proxy_url": str(os.getenv("RESIN_PROXY_URL", "http://127.0.0.1:2260") or "http://127.0.0.1:2260").strip(),
+    "resin_admin_token": str(os.getenv("RESIN_ADMIN_TOKEN", "") or "").strip(),
+    "resin_proxy_token": str(os.getenv("RESIN_PROXY_TOKEN", "") or "").strip(),
+    "resin_platform_register": str(os.getenv("RESIN_PLATFORM_REGISTER", "gemini-register") or "gemini-register").strip(),
+    "resin_platform_maintain": str(os.getenv("RESIN_PLATFORM_MAINTAIN", "gemini-maintain") or "gemini-maintain").strip(),
+    "resin_retry_forever": True,
+    "resin_retry_times": 3,
+    "resin_retry_interval_seconds": 8,
+    "resin_node_rotation_enabled": True,
+    "resin_node_register_quota": 5,
+    "resin_node_maintain_quota": 20,
+    "resin_rotation_pool_size": 2048,
     "auto_maintain": False,
     "maintain_interval_minutes": 30,
     "maintain_interval_hours": 4.0,
@@ -168,6 +167,18 @@ def _append_query_param(url: str, key: str, value: str) -> str:
 
 
 ALLOWED_PROXY_SCHEMES = {"http", "https", "socks4", "socks5"}
+SUPPORTED_PROXY_ENGINES = {"easyproxies", "resin", "auto"}
+
+
+def _normalize_proxy_engine(value: Any) -> str:
+    engine = str(value or "").strip().lower()
+    if engine in {"socks5_pool", "socks5-pool"}:
+        engine = "easyproxies"
+    if engine in {"proxy_pool", "zenproxy"}:
+        engine = "auto"
+    if engine not in SUPPORTED_PROXY_ENGINES:
+        engine = "easyproxies"
+    return engine
 
 
 def _normalize_subscription_url(raw: str) -> str:
@@ -502,6 +513,8 @@ def _normalize_config(cfg: Dict[str, Any]) -> Dict[str, Any]:
     out = dict(DEFAULT_CONFIG)
     out.update(incoming)
     out["proxy"] = str(out.get("proxy") or "").strip()
+    out["proxy_engine"] = _normalize_proxy_engine(out.get("proxy_engine"))
+
     out["easyproxies_enabled"] = bool(out.get("easyproxies_enabled", True))
     out["easyproxies_listen_proxy"] = _normalize_proxy_endpoint(
         str(out.get("easyproxies_listen_proxy") or ""),
@@ -534,6 +547,9 @@ def _normalize_config(cfg: Dict[str, Any]) -> Dict[str, Any]:
         out["easyproxies_node_maintain_quota"] = max(1, min(int(out.get("easyproxies_node_maintain_quota") or 20), 5000))
     except Exception:
         out["easyproxies_node_maintain_quota"] = 20
+    out["easyproxies_fixed_node"] = str(out.get("easyproxies_fixed_node") or "").strip()
+    if len(out["easyproxies_fixed_node"]) > 200:
+        out["easyproxies_fixed_node"] = out["easyproxies_fixed_node"][:200]
     try:
         out["easyproxies_subscription_refresh_minutes"] = max(
             1,
@@ -541,33 +557,44 @@ def _normalize_config(cfg: Dict[str, Any]) -> Dict[str, Any]:
         )
     except Exception:
         out["easyproxies_subscription_refresh_minutes"] = 60
-    # Legacy proxy-pool path is retained only for compatibility display; runtime no longer uses it.
-    out["proxy_pool_enabled"] = False
-    out["proxy_pool_api_url"] = str(out.get("proxy_pool_api_url") or DEFAULT_POOL_API_URL).strip() or DEFAULT_POOL_API_URL
-    auth_mode = str(out.get("proxy_pool_auth_mode") or DEFAULT_POOL_AUTH_MODE).strip().lower()
-    if auth_mode not in ("query", "header"):
-        auth_mode = DEFAULT_POOL_AUTH_MODE
-    out["proxy_pool_auth_mode"] = auth_mode
-    out["proxy_pool_api_key"] = str(out.get("proxy_pool_api_key") or "").strip()
+
+    out["resin_enabled"] = bool(out.get("resin_enabled", False))
+    out["resin_api_url"] = _normalize_http_url(str(out.get("resin_api_url") or "http://127.0.0.1:2260"))
+    out["resin_proxy_url"] = _normalize_proxy_endpoint(
+        str(out.get("resin_proxy_url") or ""),
+        default="http://127.0.0.1:2260",
+    ) or "http://127.0.0.1:2260"
+    out["resin_admin_token"] = str(out.get("resin_admin_token") or "").strip()
+    out["resin_proxy_token"] = str(out.get("resin_proxy_token") or "").strip()
+    out["resin_platform_register"] = str(out.get("resin_platform_register") or "gemini-register").strip() or "gemini-register"
+    out["resin_platform_maintain"] = str(out.get("resin_platform_maintain") or "gemini-maintain").strip() or "gemini-maintain"
+    if len(out["resin_platform_register"]) > 80:
+        out["resin_platform_register"] = out["resin_platform_register"][:80]
+    if len(out["resin_platform_maintain"]) > 80:
+        out["resin_platform_maintain"] = out["resin_platform_maintain"][:80]
+    out["resin_retry_forever"] = bool(out.get("resin_retry_forever", True))
     try:
-        out["proxy_pool_count"] = max(1, min(int(out.get("proxy_pool_count") or DEFAULT_POOL_COUNT), 20))
+        out["resin_retry_times"] = max(1, min(int(out.get("resin_retry_times") or 3), 60))
     except Exception:
-        out["proxy_pool_count"] = DEFAULT_POOL_COUNT
-    out["proxy_pool_country"] = str(out.get("proxy_pool_country") or DEFAULT_POOL_COUNTRY).strip().upper() or DEFAULT_POOL_COUNTRY
+        out["resin_retry_times"] = 3
     try:
-        out["proxy_pool_retry_times"] = max(1, min(int(out.get("proxy_pool_retry_times") or 3), 10))
+        out["resin_retry_interval_seconds"] = max(1, min(int(out.get("resin_retry_interval_seconds") or 8), 300))
     except Exception:
-        out["proxy_pool_retry_times"] = 3
-    # Legacy local subscription path is disabled in favor of EasyProxies subscription sync.
-    out["proxy_subscription_enabled"] = False
-    out["proxy_subscription_url"] = _normalize_subscription_url(str(out.get("proxy_subscription_url") or ""))
+        out["resin_retry_interval_seconds"] = 8
+    out["resin_node_rotation_enabled"] = bool(out.get("resin_node_rotation_enabled", True))
     try:
-        out["proxy_subscription_refresh_minutes"] = max(
-            1,
-            min(int(out.get("proxy_subscription_refresh_minutes") or 10), 24 * 60),
-        )
+        out["resin_node_register_quota"] = max(1, min(int(out.get("resin_node_register_quota") or 5), 5000))
     except Exception:
-        out["proxy_subscription_refresh_minutes"] = 10
+        out["resin_node_register_quota"] = 5
+    try:
+        out["resin_node_maintain_quota"] = max(1, min(int(out.get("resin_node_maintain_quota") or 20), 50000))
+    except Exception:
+        out["resin_node_maintain_quota"] = 20
+    try:
+        out["resin_rotation_pool_size"] = max(1, min(int(out.get("resin_rotation_pool_size") or 2048), 50000))
+    except Exception:
+        out["resin_rotation_pool_size"] = 2048
+
     out["auto_maintain"] = bool(out.get("auto_maintain", False))
     try:
         out["maintain_interval_minutes"] = max(5, int(out.get("maintain_interval_minutes") or 30))
@@ -657,7 +684,10 @@ def _normalize_config(cfg: Dict[str, Any]) -> Dict[str, Any]:
         out["proxy_fail_guard_pause_seconds"] = max(10, min(int(out.get("proxy_fail_guard_pause_seconds") or 60), 900))
     except Exception:
         out["proxy_fail_guard_pause_seconds"] = 60
-    return out
+    normalized: Dict[str, Any] = {}
+    for key in DEFAULT_CONFIG.keys():
+        normalized[key] = out.get(key)
+    return normalized
 
 
 _config = _normalize_config(_load_json(CONFIG_FILE, DEFAULT_CONFIG))
@@ -674,7 +704,7 @@ def set_config(data: Dict[str, Any]) -> Dict[str, Any]:
     with _cfg_lock:
         merged = dict(_config)
         for key, value in (data or {}).items():
-            if key in {"proxy_pool_api_key", "account_sync_api_key", "easyproxies_password"}:
+            if key in {"account_sync_api_key", "easyproxies_password", "resin_admin_token", "resin_proxy_token"}:
                 if str(value or "").strip():
                     merged[key] = str(value).strip()
                 continue
@@ -832,6 +862,16 @@ class RuntimeManager:
         self._easyproxies_rotation_maintain_used = 0
         self._easyproxies_last_switched_node = ""
         self._easyproxies_last_switch_at = 0.0
+        self._resin_rotation_register_cursor = 0
+        self._resin_rotation_register_account = ""
+        self._resin_rotation_register_used = 0
+        self._resin_rotation_maintain_cursor = 0
+        self._resin_rotation_maintain_account = ""
+        self._resin_rotation_maintain_used = 0
+        self._resin_last_switched_account = ""
+        self._resin_last_switch_at = 0.0
+        self._resin_platform_cache: Dict[str, Dict[str, Any]] = {}
+        self._resin_platform_cache_at = 0.0
         self._item_sync_queue: queue.Queue = queue.Queue(maxsize=2000)
         self._item_sync_thread = threading.Thread(target=self._item_sync_worker, daemon=True)
         self._item_sync_thread.start()
@@ -1130,42 +1170,30 @@ class RuntimeManager:
             except Exception as exc:
                 err = self._repair_possible_mojibake(str(exc))
                 self.warn(f"EasyProxies auto-exclude HK/CN failed ({reason or 'unknown'}): {err}", step="proxy")
-                return {"ok": False, "changed": 0, "matched": 0, "error": err, "reason": reason}
+                return {"ok": False, "changed": 0, "matched": 0, "skipped": 0, "error": err, "reason": reason}
 
         matched = self._easyproxies_collect_hk_cn_names(node_list)
         if not matched:
-            return {"ok": True, "changed": 0, "matched": 0, "reason": reason, "names": []}
+            return {"ok": True, "changed": 0, "matched": 0, "skipped": 0, "reason": reason, "names": []}
 
         pending = list(matched)
-
-        try:
-            self._easyproxies_request(
-                cfg,
-                "POST",
-                "/api/nodes/config/batch-toggle",
-                timeout=20,
-                json_body={"names": pending, "enabled": False},
-            )
-        except Exception as exc:
-            err = self._repair_possible_mojibake(str(exc))
-            self.warn(f"EasyProxies auto-exclude HK/CN failed ({reason or 'unknown'}): {err}", step="proxy")
-            return {
-                "ok": False,
-                "changed": 0,
-                "matched": len(matched),
-                "reason": reason,
-                "names": pending,
-                "error": err,
-            }
 
         preview = ", ".join(pending[:4])
         if len(pending) > 4:
             preview += ", ..."
         self.warn(
-            f"EasyProxies auto-excluded HK/CN nodes: count={len(pending)} reason={reason or 'unknown'} names={preview}",
+            f"EasyProxies soft-skipped HK/CN nodes (no disable): count={len(pending)} "
+            f"reason={reason or 'unknown'} names={preview}",
             step="proxy",
         )
-        return {"ok": True, "changed": len(pending), "matched": len(matched), "reason": reason, "names": pending}
+        return {
+            "ok": True,
+            "changed": 0,
+            "matched": len(matched),
+            "skipped": len(matched),
+            "reason": reason,
+            "names": pending,
+        }
 
     def _easyproxies_list_config_nodes(self, cfg: Dict[str, Any]) -> List[Dict[str, Any]]:
         payload = self._easyproxies_request(cfg, "GET", "/api/nodes/config", timeout=12)
@@ -1214,6 +1242,201 @@ class RuntimeManager:
                 names.add(name)
         return names
 
+    @staticmethod
+    def _easyproxies_compose_proxy_url(
+        scheme: str,
+        host: str,
+        port: int,
+        username: str = "",
+        password: str = "",
+    ) -> str:
+        use_scheme = str(scheme or "http").strip().lower() or "http"
+        use_host = str(host or "").strip()
+        use_port = max(1, int(port or 0))
+        user = str(username or "").strip()
+        pwd = str(password or "")
+        auth = ""
+        if user:
+            auth = quote(user, safe="")
+            if pwd:
+                auth += f":{quote(pwd, safe='')}"
+            auth += "@"
+        return f"{use_scheme}://{auth}{use_host}:{use_port}"
+
+    @staticmethod
+    def _easyproxies_find_node(nodes: List[Dict[str, Any]], node_name: str) -> Optional[Dict[str, Any]]:
+        target = str(node_name or "").strip()
+        if not target:
+            return None
+        target_l = target.lower()
+        for node in nodes:
+            if not isinstance(node, dict):
+                continue
+            name = str(node.get("name") or node.get("tag") or "").strip()
+            if not name:
+                continue
+            if name == target or name.lower() == target_l:
+                return node
+        for node in nodes:
+            if not isinstance(node, dict):
+                continue
+            tag = str(node.get("tag") or "").strip()
+            if tag and (tag == target or tag.lower() == target_l):
+                return node
+        return None
+
+    def _resolve_easyproxies_proxy_forced_node(
+        self,
+        cfg: Dict[str, Any],
+        node_name: str,
+        kind: str,
+    ) -> tuple[Dict[str, Any], str]:
+        use_node = str(node_name or "").strip()
+        if not use_node:
+            raise RuntimeError("EasyProxies fixed node is empty")
+
+        if bool(cfg.get("easyproxies_refresh_before_task", True)):
+            self._sync_easyproxies_subscription(cfg, force=False)
+
+        listen_proxy = _normalize_proxy_endpoint(
+            cfg.get("easyproxies_listen_proxy") or "",
+            default="http://127.0.0.1:2323",
+        )
+        if not listen_proxy:
+            raise RuntimeError("EasyProxies listen proxy is invalid")
+        listen_parsed = urlparse(listen_proxy)
+        listen_scheme = str(listen_parsed.scheme or "http").strip().lower() or "http"
+        listen_host = str(listen_parsed.hostname or "").strip()
+        listen_user = str(listen_parsed.username or "").strip()
+        listen_pass = str(listen_parsed.password or "").strip()
+
+        nodes_payload = self._easyproxies_request(cfg, "GET", "/api/nodes", timeout=12)
+        nodes, total, healthy = self._easyproxies_nodes_summary(nodes_payload)
+        if total <= 0:
+            raise RuntimeError("EasyProxies has no available nodes")
+        node = self._easyproxies_find_node(nodes, use_node)
+        if not node:
+            preview = ", ".join(str((n.get("name") or n.get("tag") or "")).strip() for n in nodes[:6] if isinstance(n, dict))
+            if len(nodes) > 6:
+                preview += ", ..."
+            raise RuntimeError(f"EasyProxies fixed node not found: {use_node} (candidates={preview or '-'})")
+
+        selected_name = str(node.get("name") or node.get("tag") or use_node).strip() or use_node
+        selected_tag = str(node.get("tag") or "").strip()
+        selected_port = int(node.get("port") or 0)
+        selected_listen_addr = str(node.get("listen_address") or "").strip()
+        selected_region = str(node.get("region") or "").strip().upper()
+        selected_country = str(node.get("country") or "").strip()
+
+        if selected_port <= 0:
+            raise RuntimeError(
+                f"EasyProxies fixed node has no dedicated port: {selected_name} "
+                "(need EasyProxies mode=multi-port/hybrid)"
+            )
+
+        settings_mode = ""
+        mp_addr = ""
+        mp_user = ""
+        mp_pass = ""
+        listener_user = ""
+        listener_pass = ""
+        try:
+            settings = self._easyproxies_request(cfg, "GET", "/api/settings", timeout=12)
+            if isinstance(settings, dict):
+                settings_mode = str(settings.get("mode") or "").strip().lower()
+                mp_addr = str(settings.get("multi_port_address") or "").strip()
+                mp_user = str(settings.get("multi_port_username") or "").strip()
+                mp_pass = str(settings.get("multi_port_password") or "").strip()
+                listener_user = str(settings.get("listener_username") or "").strip()
+                listener_pass = str(settings.get("listener_password") or "").strip()
+        except Exception as exc:
+            self.warn(f"EasyProxies fixed node settings fetch failed: {self._repair_possible_mojibake(str(exc))}", step="proxy")
+
+        cfg_user = ""
+        cfg_pass = ""
+        try:
+            cfg_nodes = self._easyproxies_list_config_nodes(cfg)
+            cfg_node = self._easyproxies_find_node(cfg_nodes, selected_name) or self._easyproxies_find_node(cfg_nodes, selected_tag)
+            if isinstance(cfg_node, dict):
+                cfg_user = str(cfg_node.get("username") or "").strip()
+                cfg_pass = str(cfg_node.get("password") or "").strip()
+        except Exception:
+            pass
+
+        node_host = selected_listen_addr or mp_addr or listen_host
+        if node_host in {"0.0.0.0", "::", "[::]"}:
+            node_host = listen_host
+        if not node_host:
+            api_host = str(urlparse(_normalize_http_url(cfg.get("easyproxies_api_url") or "")).hostname or "").strip()
+            node_host = api_host or "127.0.0.1"
+
+        if settings_mode and settings_mode not in {"multi-port", "hybrid"}:
+            self.warn(
+                f"EasyProxies fixed node is configured while mode={settings_mode}; "
+                "node dedicated port may not be reachable",
+                step="proxy",
+            )
+
+        node_user = cfg_user or mp_user or listener_user or listen_user
+        node_pass = cfg_pass or mp_pass or listener_pass or listen_pass
+        fixed_proxy = self._easyproxies_compose_proxy_url(
+            scheme=listen_scheme,
+            host=node_host,
+            port=selected_port,
+            username=node_user,
+            password=node_pass,
+        )
+
+        precheck_retries = max(1, min(int(cfg.get("easyproxies_retry_times") or 3), 8))
+        precheck_loc = ""
+        precheck_ip = ""
+        last_precheck_error = ""
+        for attempt in range(1, precheck_retries + 1):
+            try:
+                trace_text = trace_via_proxy(fixed_proxy, timeout=8)
+                supported, precheck_loc, precheck_ip = is_location_supported(trace_text)
+                if supported:
+                    self.info(
+                        f"EasyProxies fixed node precheck passed: node={selected_name}, attempt={attempt}/{precheck_retries}, "
+                        f"loc={precheck_loc or '?'} ip={precheck_ip or '?'}",
+                        step="proxy",
+                    )
+                    break
+                last_precheck_error = f"location restricted: loc={precheck_loc or '?'}"
+            except Exception as exc:
+                last_precheck_error = self._repair_possible_mojibake(str(exc))
+            if attempt < precheck_retries:
+                time.sleep(0.4)
+        else:
+            raise RuntimeError(
+                f"EasyProxies fixed node precheck failed: node={selected_name}, "
+                f"err={last_precheck_error or 'unknown error'}"
+            )
+
+        self.info(
+            "Proxy strategy selected: easyproxies | "
+            f"browser={_mask_proxy_for_log(fixed_proxy)} | "
+            f"upstream=easyproxies-node:{selected_name} | "
+            f"region={precheck_loc or selected_region or '?'}",
+            step="proxy",
+        )
+        self.info(
+            f"EasyProxies fixed node selected: node={selected_name}, tag={selected_tag or '-'}, "
+            f"port={selected_port}, healthy={healthy}/{total}, country={selected_country or '-'}",
+            step="proxy",
+        )
+        return (
+            {
+                "strategy": "easyproxies",
+                "proxy": fixed_proxy,
+                "upstream_proxy": f"easyproxies-node:{selected_name}",
+                "region": precheck_loc or selected_region or "",
+                "node_name": selected_name,
+                "fixed_node": selected_name,
+            },
+            selected_name,
+        )
+
     def _easyproxies_activate_single_node(
         self,
         cfg: Dict[str, Any],
@@ -1231,22 +1454,8 @@ class RuntimeManager:
         if node_name not in all_names:
             raise RuntimeError(f"EasyProxies node not found in config: {node_name}")
 
-        disable_names = [name for name in all_names if name != node_name]
-        if disable_names:
-            self._easyproxies_request(
-                cfg,
-                "POST",
-                "/api/nodes/config/batch-toggle",
-                timeout=20,
-                json_body={"names": disable_names, "enabled": False},
-            )
-        self._easyproxies_request(
-            cfg,
-            "POST",
-            "/api/nodes/config/batch-toggle",
-            timeout=20,
-            json_body={"names": [node_name], "enabled": True},
-        )
+        # Soft select only: keep EasyProxies config immutable during rotation.
+        _ = cfg
 
         with self._lock:
             self._easyproxies_last_switched_node = node_name
@@ -1268,20 +1477,7 @@ class RuntimeManager:
 
         hk_cn_names = self._easyproxies_collect_hk_cn_names(config_nodes)
         if hk_cn_names:
-            try:
-                self._easyproxies_request(
-                    cfg,
-                    "POST",
-                    "/api/nodes/config/batch-toggle",
-                    timeout=20,
-                    json_body={"names": hk_cn_names, "enabled": False},
-                )
-                self.warn(f"EasyProxies rotation auto-disabled HK/CN config nodes: {len(hk_cn_names)}", step="proxy")
-            except Exception as exc:
-                self.warn(
-                    f"EasyProxies rotation failed to disable HK/CN config nodes: {self._repair_possible_mojibake(str(exc))}",
-                    step="proxy",
-                )
+            self.warn(f"EasyProxies rotation soft-skipping HK/CN config nodes: {len(hk_cn_names)}", step="proxy")
 
         candidates = self._easyproxies_collect_rotation_candidates(config_nodes)
         if not candidates:
@@ -1374,6 +1570,394 @@ class RuntimeManager:
             step="proxy",
         )
 
+    def _easyproxies_reset_rotation_state(self, reason: str = "") -> None:
+        with self._lock:
+            self._easyproxies_rotation_cursor = 0
+            self._easyproxies_rotation_node = ""
+            self._easyproxies_rotation_register_used = 0
+            self._easyproxies_rotation_maintain_used = 0
+        self.info(f"EasyProxies rotation state reset ({reason or 'manual'})", step="proxy")
+
+    def _resin_api_request(
+        self,
+        cfg: Dict[str, Any],
+        method: str,
+        path: str,
+        timeout: int = 12,
+        json_body: Optional[Dict[str, Any]] = None,
+        params: Optional[Dict[str, Any]] = None,
+    ) -> Any:
+        api_base = _normalize_http_url(cfg.get("resin_api_url") or "").rstrip("/")
+        if not api_base:
+            raise RuntimeError("Resin API URL is empty")
+        admin_token = str(cfg.get("resin_admin_token") or "").strip()
+        if not admin_token:
+            raise RuntimeError("Resin admin token is empty")
+        url_path = "/" + str(path or "").lstrip("/")
+        headers = {
+            "Authorization": f"Bearer {admin_token}",
+            "Accept": "application/json",
+        }
+        try:
+            resp = requests.request(
+                method=str(method or "GET").upper(),
+                url=f"{api_base}{url_path}",
+                headers=headers,
+                params=params,
+                json=json_body,
+                timeout=timeout,
+            )
+        except Exception as exc:
+            raise RuntimeError(f"Resin request failed ({method} {url_path}): {exc}") from None
+
+        if resp.status_code >= 400:
+            err_msg = resp.text[:180]
+            try:
+                payload = resp.json() if resp.content else {}
+                if isinstance(payload, dict):
+                    err_obj = payload.get("error")
+                    if isinstance(err_obj, dict):
+                        err_msg = str(err_obj.get("message") or err_msg).strip() or err_msg
+            except Exception:
+                pass
+            raise RuntimeError(f"HTTP {resp.status_code}: {err_msg}")
+        if not resp.content:
+            return {}
+        try:
+            return resp.json()
+        except Exception:
+            return {"raw": resp.text}
+
+    def _resin_find_platform_by_name(self, cfg: Dict[str, Any], platform_name: str) -> Optional[Dict[str, Any]]:
+        expected = str(platform_name or "").strip().lower()
+        if not expected:
+            return None
+        cache_ttl = 30.0
+        with self._lock:
+            cached = dict(self._resin_platform_cache.get(expected) or {})
+            cached_age = time.time() - float(self._resin_platform_cache_at or 0.0)
+        if cached and cached_age <= cache_ttl:
+            return cached
+
+        offset = 0
+        limit = 200
+        matched: Optional[Dict[str, Any]] = None
+        while offset < 10000:
+            payload = self._resin_api_request(
+                cfg,
+                "GET",
+                "/api/v1/platforms",
+                timeout=12,
+                params={"sort_by": "name", "sort_order": "asc", "limit": limit, "offset": offset},
+            )
+            items = payload.get("items") if isinstance(payload, dict) and isinstance(payload.get("items"), list) else []
+            for item in items:
+                if not isinstance(item, dict):
+                    continue
+                if str(item.get("name") or "").strip().lower() == expected:
+                    matched = item
+                    break
+            if matched is not None:
+                break
+            total = int(payload.get("total") or len(items)) if isinstance(payload, dict) else len(items)
+            offset += limit
+            if not items or offset >= max(total, len(items)):
+                break
+
+        if matched:
+            with self._lock:
+                self._resin_platform_cache[expected] = dict(matched)
+                self._resin_platform_cache_at = time.time()
+        return matched
+
+    def _resin_ensure_platform(self, cfg: Dict[str, Any], platform_name: str) -> Dict[str, Any]:
+        target_name = str(platform_name or "").strip()
+        if not target_name:
+            raise RuntimeError("Resin platform name is empty")
+        found = self._resin_find_platform_by_name(cfg, target_name)
+        if isinstance(found, dict):
+            return found
+        try:
+            created = self._resin_api_request(
+                cfg,
+                "POST",
+                "/api/v1/platforms",
+                timeout=15,
+                json_body={"name": target_name},
+            )
+            if isinstance(created, dict):
+                with self._lock:
+                    self._resin_platform_cache[target_name.lower()] = dict(created)
+                    self._resin_platform_cache_at = time.time()
+                return created
+        except Exception as exc:
+            # Handle concurrent create from another worker.
+            if "409" not in str(exc):
+                raise
+
+        found = self._resin_find_platform_by_name(cfg, target_name)
+        if isinstance(found, dict):
+            return found
+        raise RuntimeError(f"Resin platform not found and create failed: {target_name}")
+
+    @staticmethod
+    def _resin_normalize_account_name(raw: str, fallback: str) -> str:
+        account = re.sub(r"[^0-9A-Za-z._-]+", "-", str(raw or "").strip())
+        account = account.strip(".-")
+        if not account:
+            account = str(fallback or "").strip()
+        if not account:
+            return ""
+        if len(account) > 80:
+            account = account[:80]
+        return account
+
+    @staticmethod
+    def _resin_rotation_account_name(kind: str, idx: int) -> str:
+        prefix = "reg" if str(kind or "").strip().lower() == "register" else "maint"
+        return f"{prefix}-{int(idx):05d}"
+
+    def _resin_compose_proxy_url(self, cfg: Dict[str, Any], platform_name: str, account_name: str) -> str:
+        proxy_base = _normalize_proxy_endpoint(
+            cfg.get("resin_proxy_url") or "",
+            default="http://127.0.0.1:2260",
+        )
+        if not proxy_base:
+            raise RuntimeError("Resin proxy URL is empty")
+        parsed = urlparse(proxy_base)
+        scheme = str(parsed.scheme or "http").strip().lower() or "http"
+        host = str(parsed.hostname or "").strip()
+        if not host:
+            raise RuntimeError("Resin proxy URL is invalid")
+        if ":" in host and not host.startswith("["):
+            host = f"[{host}]"
+        hostport = host
+        if parsed.port:
+            hostport = f"{host}:{parsed.port}"
+
+        platform_text = str(platform_name or "").strip()
+        account_text = self._resin_normalize_account_name(account_name, "default")
+        identity = f"{platform_text}.{account_text}" if platform_text else account_text
+        username = quote(identity, safe="._-")
+        token = str(cfg.get("resin_proxy_token") or "").strip()
+        if token:
+            auth = f"{username}:{quote(token, safe='')}@"
+        else:
+            auth = f"{username}@"
+        return normalize_proxy_value(f"{scheme}://{auth}{hostport}")
+
+    def _resin_select_rotation_account(
+        self,
+        cfg: Dict[str, Any],
+        kind: str,
+        requested_units: int,
+    ) -> tuple[str, int]:
+        task_kind = "maintain" if str(kind or "").strip().lower() == "maintain" else "register"
+        try:
+            req_units = max(1, int(requested_units or 1))
+        except Exception:
+            req_units = 1
+
+        if task_kind == "register":
+            quota = max(1, int(cfg.get("resin_node_register_quota") or 5))
+        else:
+            quota = max(1, int(cfg.get("resin_node_maintain_quota") or 20))
+        pool_size = max(1, int(cfg.get("resin_rotation_pool_size") or 2048))
+
+        with self._lock:
+            if task_kind == "register":
+                start_idx = self._resin_rotation_register_cursor % pool_size
+                current_account = self._resin_rotation_register_account
+                current_used = max(0, int(self._resin_rotation_register_used))
+            else:
+                start_idx = self._resin_rotation_maintain_cursor % pool_size
+                current_account = self._resin_rotation_maintain_account
+                current_used = max(0, int(self._resin_rotation_maintain_used))
+
+        for offset in range(pool_size):
+            idx = (start_idx + offset) % pool_size
+            account = self._resin_rotation_account_name(task_kind, idx)
+            used = current_used if account == current_account else 0
+            remaining = max(0, quota - used)
+            if remaining <= 0:
+                continue
+            units = min(req_units, remaining)
+            with self._lock:
+                switched = False
+                if task_kind == "register":
+                    if self._resin_rotation_register_account != account:
+                        switched = True
+                    self._resin_rotation_register_account = account
+                    self._resin_rotation_register_used = used + units
+                    consumed = self._resin_rotation_register_used >= quota
+                    self._resin_rotation_register_cursor = (idx + 1) % pool_size if consumed else idx
+                else:
+                    if self._resin_rotation_maintain_account != account:
+                        switched = True
+                    self._resin_rotation_maintain_account = account
+                    self._resin_rotation_maintain_used = used + units
+                    consumed = self._resin_rotation_maintain_used >= quota
+                    self._resin_rotation_maintain_cursor = (idx + 1) % pool_size if consumed else idx
+                if switched:
+                    self._resin_last_switched_account = account
+                    self._resin_last_switch_at = time.time()
+            return account, units
+
+        raise RuntimeError("Resin rotation failed: no account slot available")
+
+    def _resin_force_switch_next_account(self, kind: str, reason: str = "") -> None:
+        task_kind = "maintain" if str(kind or "").strip().lower() == "maintain" else "register"
+        with self._lock:
+            if task_kind == "register":
+                old_account = self._resin_rotation_register_account
+                self._resin_rotation_register_cursor += 1
+                self._resin_rotation_register_account = ""
+                self._resin_rotation_register_used = 0
+            else:
+                old_account = self._resin_rotation_maintain_account
+                self._resin_rotation_maintain_cursor += 1
+                self._resin_rotation_maintain_account = ""
+                self._resin_rotation_maintain_used = 0
+        self.warn(
+            f"Resin force switch next identity ({reason or 'runtime-error'}), prev={old_account or '-'}",
+            step="proxy",
+        )
+
+    def _resin_reset_rotation_state(self, reason: str = "") -> None:
+        with self._lock:
+            self._resin_rotation_register_cursor = 0
+            self._resin_rotation_register_account = ""
+            self._resin_rotation_register_used = 0
+            self._resin_rotation_maintain_cursor = 0
+            self._resin_rotation_maintain_account = ""
+            self._resin_rotation_maintain_used = 0
+        self.info(f"Resin rotation state reset ({reason or 'manual'})", step="proxy")
+
+    def _resolve_resin_proxy_for_task(
+        self,
+        cfg: Dict[str, Any],
+        kind: str,
+        requested_units: int,
+        fixed_account: str = "",
+    ) -> tuple[Dict[str, Any], int, str]:
+        if not bool(cfg.get("resin_enabled", False)):
+            raise RuntimeError("Resin is disabled")
+        task_kind = "maintain" if str(kind or "").strip().lower() == "maintain" else "register"
+        if task_kind == "register":
+            platform_name = str(cfg.get("resin_platform_register") or "").strip()
+        else:
+            platform_name = str(cfg.get("resin_platform_maintain") or "").strip()
+        if not platform_name:
+            raise RuntimeError("Resin platform name is empty")
+
+        platform = self._resin_ensure_platform(cfg, platform_name)
+        platform_name = str(platform.get("name") or platform_name).strip() or platform_name
+
+        try:
+            req_units = max(1, int(requested_units or 1))
+        except Exception:
+            req_units = 1
+
+        fixed_account_name = self._resin_normalize_account_name(fixed_account, "")
+        if fixed_account_name:
+            account_name = fixed_account_name
+            units = req_units
+        elif bool(cfg.get("resin_node_rotation_enabled", True)):
+            account_name, units = self._resin_select_rotation_account(cfg, task_kind, req_units)
+        else:
+            account_name = self._resin_rotation_account_name(task_kind, 0)
+            units = req_units
+
+        browser_proxy = self._resin_compose_proxy_url(cfg, platform_name, account_name)
+        upstream_identity = f"resin:{platform_name}.{account_name}"
+        self.info(
+            f"Resin identity selected: platform={platform_name}, account={account_name}, kind={task_kind}, units={units}",
+            step="proxy",
+        )
+        self.info(
+            "Proxy strategy selected: resin | "
+            f"browser={_mask_proxy_for_log(browser_proxy)} | upstream={upstream_identity}",
+            step="proxy",
+        )
+        return {
+            "strategy": "resin",
+            "proxy": browser_proxy,
+            "upstream_proxy": upstream_identity,
+            "region": "",
+            "resin_platform": platform_name,
+            "resin_account": account_name,
+            "node_name": account_name,
+            "node_units": units,
+        }, units, account_name
+
+    def _resolve_resin_proxy_with_retry(
+        self,
+        cfg: Dict[str, Any],
+        kind: str,
+        requested_units: int,
+        fixed_account: str = "",
+    ) -> tuple[Dict[str, Any], int, str]:
+        retry_forever = bool(cfg.get("resin_retry_forever", True))
+        retry_times = max(1, min(int(cfg.get("resin_retry_times") or 3), 60))
+        retry_interval = max(1, min(int(cfg.get("resin_retry_interval_seconds") or 8), 300))
+        attempt = 0
+        while True:
+            attempt += 1
+            try:
+                return self._resolve_resin_proxy_for_task(cfg, kind, requested_units, fixed_account=fixed_account)
+            except Exception as exc:
+                self.warn(
+                    f"Resin resolve failed: attempt={attempt}"
+                    f"{'' if retry_forever else '/' + str(retry_times)} err={exc}",
+                    step="proxy",
+                )
+                if (not retry_forever) and attempt >= retry_times:
+                    raise
+                time.sleep(retry_interval)
+
+    def test_resin(self) -> Dict[str, Any]:
+        cfg = get_config()
+        if not bool(cfg.get("resin_enabled", False)):
+            return {"ok": False, "error": "Resin is disabled"}
+        try:
+            health = requests.get(f"{_normalize_http_url(cfg.get('resin_api_url') or '').rstrip('/')}/healthz", timeout=6)
+            if health.status_code >= 400:
+                raise RuntimeError(f"/healthz HTTP {health.status_code}: {health.text[:120]}")
+        except Exception as exc:
+            return {"ok": False, "stage": "healthz", "error": self._repair_possible_mojibake(str(exc))}
+
+        try:
+            platform_name = str(cfg.get("resin_platform_register") or "").strip() or "gemini-register"
+            platform = self._resin_ensure_platform(cfg, platform_name)
+            account = self._resin_rotation_account_name("register", int(time.time()) % 99999)
+            proxy_url = self._resin_compose_proxy_url(cfg, str(platform.get("name") or platform_name), account)
+            trace_text = trace_via_proxy(proxy_url, timeout=10)
+            trace_map = parse_trace(trace_text)
+            supported, loc, ip = is_location_supported(trace_text)
+            leases = self._resin_api_request(
+                cfg,
+                "GET",
+                f"/api/v1/platforms/{platform.get('id')}/leases",
+                timeout=12,
+                params={"limit": 1, "offset": 0},
+            )
+            lease_total = int(leases.get("total") or 0) if isinstance(leases, dict) else 0
+            return {
+                "ok": True,
+                "api_url": _normalize_http_url(cfg.get("resin_api_url") or ""),
+                "proxy_url": _normalize_proxy_endpoint(cfg.get("resin_proxy_url") or "", default="http://127.0.0.1:2260"),
+                "platform": str(platform.get("name") or platform_name),
+                "platform_id": str(platform.get("id") or ""),
+                "test_account": account,
+                "loc": loc or "",
+                "ip": ip or "",
+                "supported": bool(supported),
+                "active_leases": lease_total,
+                "trace": trace_map,
+            }
+        except Exception as exc:
+            return {"ok": False, "stage": "proxy", "error": self._repair_possible_mojibake(str(exc))}
+
     def test_easyproxies(self) -> Dict[str, Any]:
         cfg = get_config()
         listen_proxy = _normalize_proxy_endpoint(
@@ -1387,10 +1971,7 @@ class RuntimeManager:
             nodes_payload = self._easyproxies_request(cfg, "GET", "/api/nodes", timeout=12)
             nodes, total, healthy = self._easyproxies_nodes_summary(nodes_payload)
             auto_result = self._easyproxies_auto_exclude_hk_cn_nodes(cfg, nodes, reason="test-initial")
-            auto_disabled = int(auto_result.get("changed") or 0)
-            if auto_disabled > 0:
-                nodes_payload = self._easyproxies_request(cfg, "GET", "/api/nodes", timeout=12)
-                nodes, total, healthy = self._easyproxies_nodes_summary(nodes_payload)
+            auto_skipped = int(auto_result.get("skipped") or auto_result.get("matched") or 0)
         except Exception as exc:
             return {
                 "ok": False,
@@ -1404,13 +1985,8 @@ class RuntimeManager:
             supported, loc, ip = is_location_supported(trace_text)
             if (not supported) and loc in {"CN", "HK"}:
                 retry_auto = self._easyproxies_auto_exclude_hk_cn_nodes(cfg, reason="test-trace")
-                retry_changed = int(retry_auto.get("changed") or 0)
-                auto_disabled += retry_changed
-                if retry_changed > 0:
-                    time.sleep(0.6)
-                    trace_text = trace_via_proxy(listen_proxy, timeout=10)
-                    trace_map = parse_trace(trace_text)
-                    supported, loc, ip = is_location_supported(trace_text)
+                retry_skipped = int(retry_auto.get("skipped") or retry_auto.get("matched") or 0)
+                auto_skipped += retry_skipped
             return {
                 "ok": bool(supported),
                 "stage": "proxy_trace",
@@ -1420,7 +1996,8 @@ class RuntimeManager:
                 "trace": trace_map,
                 "total_nodes": total,
                 "healthy_nodes": healthy,
-                "auto_disabled_nodes": auto_disabled,
+                "auto_disabled_nodes": auto_skipped,
+                "auto_skipped_nodes": auto_skipped,
                 "listen_proxy": listen_proxy,
                 "error": None if supported else "location restricted (CN/HK)",
             }
@@ -1439,6 +2016,50 @@ class RuntimeManager:
                 "listen_proxy": listen_proxy,
                 "hint": hint,
             }
+
+    def list_easyproxies_nodes(self) -> Dict[str, Any]:
+        cfg = get_config()
+        enabled = bool(cfg.get("easyproxies_enabled", True))
+
+        settings_mode = ""
+        try:
+            settings = self._easyproxies_request(cfg, "GET", "/api/settings", timeout=10)
+            if isinstance(settings, dict):
+                settings_mode = str(settings.get("mode") or "").strip().lower()
+        except Exception:
+            settings_mode = ""
+
+        payload = self._easyproxies_request(cfg, "GET", "/api/nodes", timeout=12)
+        nodes, total, healthy = self._easyproxies_nodes_summary(payload)
+        out_nodes: List[Dict[str, Any]] = []
+        for node in nodes:
+            if not isinstance(node, dict):
+                continue
+            name = str(node.get("name") or node.get("tag") or "").strip()
+            if not name:
+                continue
+            out_nodes.append(
+                {
+                    "name": name,
+                    "tag": str(node.get("tag") or "").strip(),
+                    "region": str(node.get("region") or "").strip(),
+                    "country": str(node.get("country") or "").strip(),
+                    "port": int(node.get("port") or 0),
+                    "listen_address": str(node.get("listen_address") or "").strip(),
+                    "available": bool(node.get("available")),
+                    "initial_check_done": bool(node.get("initial_check_done")),
+                    "blacklisted": bool(node.get("blacklisted")),
+                }
+            )
+        out_nodes.sort(key=lambda x: str(x.get("name") or "").lower())
+        return {
+            "ok": True,
+            "enabled": enabled,
+            "mode": settings_mode,
+            "total_nodes": total,
+            "healthy_nodes": healthy,
+            "nodes": out_nodes,
+        }
 
     @staticmethod
     def _mask_upstream_proxy_for_log(proxy: str) -> str:
@@ -1460,6 +2081,8 @@ class RuntimeManager:
         strategy = str(proxy_info.get("strategy") or "").strip()
         upstream_proxy = normalize_proxy_value(proxy_info.get("upstream_proxy") or "")
         region = str(proxy_info.get("region") or "").strip()
+        resin_platform = str(proxy_info.get("resin_platform") or "").strip()
+        resin_account = str(proxy_info.get("resin_account") or "").strip()
         env: Dict[str, str] = {}
         if strategy:
             env["PROXY_STRATEGY"] = strategy
@@ -1467,6 +2090,10 @@ class RuntimeManager:
             env["PROXY_UPSTREAM"] = upstream_proxy
         if region:
             env["PROXY_REGION"] = region
+        if resin_platform:
+            env["PROXY_PLATFORM"] = resin_platform
+        if resin_account:
+            env["PROXY_ACCOUNT"] = resin_account
         return env
 
     def _easyproxies_auth_token(self, cfg: Dict[str, Any]) -> tuple[str, str]:
@@ -1578,13 +2205,13 @@ class RuntimeManager:
             self._easyproxies_last_refresh_at = now_ts
             self._easyproxies_last_sync_url = sub_url
         auto_result = self._easyproxies_auto_exclude_hk_cn_nodes(cfg, reason="subscription-sync")
-        auto_changed = int(auto_result.get("changed") or 0)
+        auto_skipped = int(auto_result.get("skipped") or auto_result.get("matched") or 0)
         self.info(
             f"EasyProxies subscription synced and refreshed: url={sub_url}, interval={refresh_minutes}m",
             step="proxy",
         )
-        if auto_changed > 0:
-            self.info(f"EasyProxies post-sync auto-excluded HK/CN nodes: {auto_changed}", step="proxy")
+        if auto_skipped > 0:
+            self.info(f"EasyProxies post-sync soft-skipped HK/CN nodes: {auto_skipped}", step="proxy")
         return {"ok": True, "skipped": False, "subscription_url": sub_url, "refresh_minutes": refresh_minutes}
 
     def _refresh_easyproxies_runtime(self, cfg: Dict[str, Any], reason: str) -> None:
@@ -1611,11 +2238,11 @@ class RuntimeManager:
         nodes_payload = self._easyproxies_request(cfg, "GET", "/api/nodes", timeout=12)
         nodes, total, healthy = self._easyproxies_nodes_summary(nodes_payload)
         auto_result = self._easyproxies_auto_exclude_hk_cn_nodes(cfg, nodes, reason="resolve-initial")
-        if int(auto_result.get("changed") or 0) > 0:
-            nodes_payload = self._easyproxies_request(cfg, "GET", "/api/nodes", timeout=12)
-            nodes, total, healthy = self._easyproxies_nodes_summary(nodes_payload)
+        auto_skipped = int(auto_result.get("skipped") or auto_result.get("matched") or 0)
+        if auto_skipped > 0:
+            self.info(f"EasyProxies resolve soft-skipped HK/CN nodes: {auto_skipped}", step="proxy")
         if total <= 0:
-            raise RuntimeError("EasyProxies has no available nodes (HK/CN nodes may have been auto-excluded)")
+            raise RuntimeError("EasyProxies has no available nodes")
 
         self.info(f"EasyProxies ready: total={total}, healthy={healthy}, proxy={_mask_proxy_for_log(listen_proxy)}", step="proxy")
 
@@ -1637,16 +2264,12 @@ class RuntimeManager:
                 last_precheck_error = f"location restricted: loc={precheck_loc or '?'}"
                 if precheck_loc in {"CN", "HK"}:
                     retry_auto = self._easyproxies_auto_exclude_hk_cn_nodes(cfg, reason=f"resolve-precheck-{attempt}")
-                    retry_changed = int(retry_auto.get("changed") or 0)
-                    if retry_changed > 0:
-                        nodes_payload = self._easyproxies_request(cfg, "GET", "/api/nodes", timeout=12)
-                        _, total, healthy = self._easyproxies_nodes_summary(nodes_payload)
+                    retry_skipped = int(retry_auto.get("skipped") or retry_auto.get("matched") or 0)
+                    if retry_skipped > 0:
                         self.warn(
-                            f"EasyProxies precheck loc={precheck_loc} -> auto-switched nodes (changed={retry_changed}, total={total}, healthy={healthy})",
+                            f"EasyProxies precheck loc={precheck_loc} -> soft-skip HK/CN candidates={retry_skipped} (no disable)",
                             step="proxy",
                         )
-                        if total <= 0:
-                            raise RuntimeError("EasyProxies has no available nodes after excluding HK/CN")
             except Exception as exc:
                 last_precheck_error = str(exc)
             if attempt < precheck_retries:
@@ -1750,36 +2373,58 @@ class RuntimeManager:
             "region": "",
         }
 
-    def _resolve_runtime_proxy(self, cfg: Dict[str, Any]) -> Dict[str, Any]:
+    def _resolve_runtime_proxy(
+        self,
+        cfg: Dict[str, Any],
+        kind: str = "register",
+        requested_units: int = 1,
+    ) -> Dict[str, Any]:
         static_proxy = normalize_proxy_value(cfg.get("proxy") or "")
-        easyproxies_enabled = bool(cfg.get("easyproxies_enabled", True))
-        easyproxies_retry_forever = bool(cfg.get("easyproxies_retry_forever", True))
-        easyproxies_retry_times = max(1, min(int(cfg.get("easyproxies_retry_times") or 3), 60))
-        easyproxies_retry_interval_seconds = max(1, min(int(cfg.get("easyproxies_retry_interval_seconds") or 8), 300))
-        if easyproxies_enabled:
-            attempt = 0
-            while True:
-                attempt += 1
-                try:
-                    return self._resolve_easyproxies_proxy(cfg)
-                except Exception as exc:
-                    self.warn(
-                        f"EasyProxies resolve failed: attempt={attempt}"
-                        f"{'' if easyproxies_retry_forever else '/' + str(easyproxies_retry_times)} err={exc}",
-                        step="proxy",
-                    )
-                    if not easyproxies_retry_forever and attempt >= easyproxies_retry_times:
-                        if static_proxy:
-                            self.warn(
-                                f"EasyProxies unavailable, fallback to static proxy: {exc}",
-                                step="proxy",
-                            )
+        engine = _normalize_proxy_engine(cfg.get("proxy_engine"))
+        easy_enabled = bool(cfg.get("easyproxies_enabled", True))
+        resin_enabled = bool(cfg.get("resin_enabled", False))
+
+        providers: List[str] = []
+        if engine == "easyproxies":
+            if easy_enabled:
+                providers.append("easyproxies")
+        elif engine == "resin":
+            if resin_enabled:
+                providers.append("resin")
+        else:
+            if resin_enabled:
+                providers.append("resin")
+            if easy_enabled:
+                providers.append("easyproxies")
+
+        for provider in providers:
+            if provider == "easyproxies":
+                easy_retry_forever = bool(cfg.get("easyproxies_retry_forever", True))
+                easy_retry_times = max(1, min(int(cfg.get("easyproxies_retry_times") or 3), 60))
+                easy_retry_interval = max(1, min(int(cfg.get("easyproxies_retry_interval_seconds") or 8), 300))
+                attempt = 0
+                while True:
+                    attempt += 1
+                    try:
+                        return self._resolve_easyproxies_proxy(cfg)
+                    except Exception as exc:
+                        self.warn(
+                            f"EasyProxies resolve failed: attempt={attempt}"
+                            f"{'' if easy_retry_forever else '/' + str(easy_retry_times)} err={exc}",
+                            step="proxy",
+                        )
+                        if (not easy_retry_forever) and attempt >= easy_retry_times:
                             break
-                        raise RuntimeError(f"EasyProxies unavailable: {exc}; no fallback proxy available") from None
-                    if easyproxies_retry_forever or attempt < easyproxies_retry_times:
-                        time.sleep(easyproxies_retry_interval_seconds)
-                        continue
-                    break
+                        time.sleep(easy_retry_interval)
+                continue
+
+            if provider == "resin":
+                try:
+                    proxy_info, _, _ = self._resolve_resin_proxy_with_retry(cfg, kind, requested_units)
+                    return proxy_info
+                except Exception as exc:
+                    self.warn(f"Resin unavailable, fallback to next strategy: {exc}", step="proxy")
+                continue
 
         if static_proxy:
             self.info(
@@ -1828,6 +2473,7 @@ class RuntimeManager:
         target_count: int = 0,
         extra_env: Optional[Dict[str, str]] = None,
         remaining_after_success: int = 0,
+        fixed_node_name: str = "",
     ) -> None:
         proc: Optional[subprocess.Popen] = None
         cfg = get_config()
@@ -1843,7 +2489,19 @@ class RuntimeManager:
         with self._lock:
             run_strategy = str(self.current_proxy_strategy or "").strip()
             run_upstream = str(self.current_proxy_upstream or "").strip()
-        if run_strategy == "easyproxies" and bool(cfg.get("easyproxies_node_rotation_enabled", True)):
+        fixed_node_name = str(fixed_node_name or "").strip()
+        easyproxies_rotation_active = (
+            run_strategy == "easyproxies"
+            and bool(cfg.get("easyproxies_node_rotation_enabled", True))
+            and not fixed_node_name
+        )
+        resin_rotation_active = (
+            run_strategy == "resin"
+            and bool(cfg.get("resin_node_rotation_enabled", True))
+            and not fixed_node_name
+        )
+        segmented_rotation_active = easyproxies_rotation_active or resin_rotation_active
+        if run_strategy in {"easyproxies", "resin"} and (segmented_rotation_active or fixed_node_name):
             # Active per-node rotation mode should not reload runtime during task, it may break browser session.
             rotate_interval_seconds = 0
 
@@ -1903,9 +2561,12 @@ class RuntimeManager:
             easyproxies_api_url = _normalize_http_url(cfg.get("easyproxies_api_url") or "")
             if easyproxies_api_url:
                 run_env["EASYPROXIES_API_URL"] = easyproxies_api_url
+            resin_api_url = _normalize_http_url(cfg.get("resin_api_url") or "")
+            if resin_api_url:
+                run_env["RESIN_API_URL"] = resin_api_url
             # Keep scripts from trying old socks5-pool switching paths.
-            if run_strategy == "easyproxies":
-                # EasyProxies mode rotates from manager; disable legacy in-script switch.
+            if run_strategy in {"easyproxies", "resin"}:
+                # Manager-side engine/rotation handles switching; disable legacy in-script switch.
                 run_env["MAIL_PROXY_ROTATE_RETRIES"] = "0"
                 run_env["MAIL_PROXY_SWITCH_ATTEMPTS"] = "0"
                 run_env["MAIL_PROXY_SWITCH_VALIDATE"] = "0"
@@ -2175,8 +2836,7 @@ class RuntimeManager:
                     )
                     if (
                         remaining_after_success > 0
-                        and run_strategy == "easyproxies"
-                        and bool(cfg.get("easyproxies_node_rotation_enabled", True))
+                        and segmented_rotation_active
                         and final_success > 0
                     ):
                         restart_requested = True
@@ -2216,8 +2876,7 @@ class RuntimeManager:
                     self.success(f"{'Auto' if auto_triggered else 'Manual'} maintain task completed", step="maintain")
                     if (
                         (not restart_requested)
-                        and run_strategy == "easyproxies"
-                        and bool(cfg.get("easyproxies_node_rotation_enabled", True))
+                        and segmented_rotation_active
                         and target_units > 0
                         and maintain_processed >= target_units
                         and progress_success > 0
@@ -2239,8 +2898,10 @@ class RuntimeManager:
                     self.error(f"Maintain task exited abnormally, code={return_code}", step="maintain")
 
             if proxy_fail_guard_triggered:
-                if run_strategy == "easyproxies" and bool(cfg.get("easyproxies_node_rotation_enabled", True)):
+                if easyproxies_rotation_active:
                     self._easyproxies_force_switch_next_node(reason=f"proxy-fail-guard-{kind}")
+                elif resin_rotation_active:
+                    self._resin_force_switch_next_account(kind, reason=f"proxy-fail-guard-{kind}")
                 if kind == "register":
                     processed = max(progress_done, progress_success + progress_fail)
                     base_total = max(progress_total, int(target_count or 1))
@@ -2282,8 +2943,10 @@ class RuntimeManager:
                         )
 
             if (not restart_requested) and stalled and stall_restart_enabled:
-                if run_strategy == "easyproxies" and bool(cfg.get("easyproxies_node_rotation_enabled", True)):
+                if easyproxies_rotation_active:
                     self._easyproxies_force_switch_next_node(reason=f"watchdog-stall-{kind}")
+                elif resin_rotation_active:
+                    self._resin_force_switch_next_account(kind, reason=f"watchdog-stall-{kind}")
                 if kind == "register":
                     processed = max(progress_done, progress_success + progress_fail)
                     base_total = max(progress_total, int(target_count or 1))
@@ -2321,17 +2984,20 @@ class RuntimeManager:
             if (
                 (not restart_requested)
                 and (return_code != 0)
-                and run_strategy == "easyproxies"
+                and run_strategy in {"easyproxies", "resin"}
                 and proxy_fail_guard_enabled
                 and stall_restart_enabled
                 and proxy_related_error_seen
             ):
-                if bool(cfg.get("easyproxies_node_rotation_enabled", True)):
+                if easyproxies_rotation_active:
                     self._easyproxies_force_switch_next_node(reason=f"abnormal-exit-{kind}")
-                try:
-                    self._refresh_easyproxies_runtime(cfg, reason=f"abnormal-exit-{kind}")
-                except Exception:
-                    pass
+                elif resin_rotation_active:
+                    self._resin_force_switch_next_account(kind, reason=f"abnormal-exit-{kind}")
+                if run_strategy == "easyproxies":
+                    try:
+                        self._refresh_easyproxies_runtime(cfg, reason=f"abnormal-exit-{kind}")
+                    except Exception:
+                        pass
                 if kind == "register":
                     processed = max(progress_done, progress_success + progress_fail)
                     base_total = max(progress_total, int(target_count or 1))
@@ -2430,17 +3096,29 @@ class RuntimeManager:
                     )
                     time.sleep(restart_delay_seconds)
                 if kind == "register":
-                    self.start_register(restart_target, auto_triggered=auto_triggered, internal_restart=True)
+                    self.start_register(
+                        restart_target,
+                        auto_triggered=auto_triggered,
+                        internal_restart=True,
+                        fixed_node_name=fixed_node_name,
+                    )
                 else:
                     self.start_maintain(
                         auto_triggered=auto_triggered,
                         internal_restart=True,
                         limit=max(0, int(restart_target or 0)),
+                        fixed_node_name=fixed_node_name,
                     )
             except Exception as exc:
                 self.error(f"Watchdog restart {kind} failed: {exc}", step=kind)
 
-    def start_register(self, count: int, auto_triggered: bool = False, internal_restart: bool = False) -> Dict[str, Any]:
+    def start_register(
+        self,
+        count: int,
+        auto_triggered: bool = False,
+        internal_restart: bool = False,
+        fixed_node_name: Optional[str] = None,
+    ) -> Dict[str, Any]:
         if not REGISTER_SCRIPT.exists():
             raise RuntimeError(f"Register script not found: {REGISTER_SCRIPT}")
         target_requested = max(1, int(count))
@@ -2456,20 +3134,74 @@ class RuntimeManager:
 
         try:
             cfg = get_config()
-            if bool(cfg.get("easyproxies_enabled", True)) and bool(cfg.get("easyproxies_node_rotation_enabled", True)):
+            proxy_engine = _normalize_proxy_engine(cfg.get("proxy_engine"))
+            requested_fixed_node = str(fixed_node_name or "").strip() if fixed_node_name is not None else ""
+            # Manual/API start should respect request value (including empty to clear),
+            # auto scheduler keeps backward-compatibility by reading persisted config.
+            if fixed_node_name is None:
+                use_fixed_node = str(cfg.get("easyproxies_fixed_node") or "").strip() if proxy_engine == "easyproxies" else ""
+            else:
+                use_fixed_node = requested_fixed_node
+
+            if proxy_engine == "easyproxies":
+                if use_fixed_node:
+                    if not bool(cfg.get("easyproxies_enabled", True)):
+                        raise RuntimeError("Fixed node requires easyproxies_enabled=true")
+                    proxy_info, rotated_node = self._resolve_easyproxies_proxy_forced_node(cfg, use_fixed_node, "register")
+                elif bool(cfg.get("easyproxies_enabled", True)) and bool(cfg.get("easyproxies_node_rotation_enabled", True)):
+                    if (
+                        not auto_triggered
+                        and fixed_node_name is not None
+                        and not requested_fixed_node
+                        and not internal_restart
+                    ):
+                        with self._lock:
+                            has_prev_rotation_node = bool(self._easyproxies_rotation_node)
+                        if has_prev_rotation_node:
+                            self._easyproxies_force_switch_next_node(reason="manual-next-register")
+                    try:
+                        proxy_info, rotated_units, rotated_node = self._resolve_easyproxies_proxy_with_rotation(
+                            cfg,
+                            "register",
+                            target_requested,
+                        )
+                        target = max(1, int(rotated_units or target_requested))
+                    except Exception as exc:
+                        self.warn(f"EasyProxies rotation failed, fallback to runtime strategy: {exc}", step="proxy")
+                        proxy_info = self._resolve_runtime_proxy(cfg, kind="register", requested_units=target_requested)
+                        rotated_node = ""
+                else:
+                    proxy_info = self._resolve_runtime_proxy(cfg, kind="register", requested_units=target_requested)
+                    rotated_node = ""
+            elif proxy_engine == "resin":
+                if (
+                    not auto_triggered
+                    and fixed_node_name is not None
+                    and not requested_fixed_node
+                    and not internal_restart
+                    and bool(cfg.get("resin_node_rotation_enabled", True))
+                ):
+                    with self._lock:
+                        has_prev_rotation_identity = bool(self._resin_rotation_register_account)
+                    if has_prev_rotation_identity:
+                        self._resin_force_switch_next_account("register", reason="manual-next-register")
                 try:
-                    proxy_info, rotated_units, rotated_node = self._resolve_easyproxies_proxy_with_rotation(
+                    proxy_info, rotated_units, rotated_node = self._resolve_resin_proxy_with_retry(
                         cfg,
                         "register",
                         target_requested,
+                        fixed_account=use_fixed_node,
                     )
                     target = max(1, int(rotated_units or target_requested))
                 except Exception as exc:
-                    self.warn(f"EasyProxies rotation failed, fallback to runtime strategy: {exc}", step="proxy")
-                    proxy_info = self._resolve_runtime_proxy(cfg)
+                    self.warn(f"Resin rotation failed, fallback to runtime strategy: {exc}", step="proxy")
+                    fallback_cfg = dict(cfg)
+                    fallback_cfg["resin_enabled"] = False
+                    fallback_cfg["proxy_engine"] = "auto"
+                    proxy_info = self._resolve_runtime_proxy(fallback_cfg, kind="register", requested_units=target_requested)
                     rotated_node = ""
             else:
-                proxy_info = self._resolve_runtime_proxy(cfg)
+                proxy_info = self._resolve_runtime_proxy(cfg, kind="register", requested_units=target_requested)
                 rotated_node = ""
         except Exception:
             with self._lock:
@@ -2504,8 +3236,22 @@ class RuntimeManager:
             f"upstream={self._mask_upstream_proxy_for_log(upstream_proxy) or '-'}, region={region or '-'}",
             step="register",
         )
-        if rotated_node:
-            self.info(f"Register node rotation: node={rotated_node}, requested={target_requested}, actual={target}", step="register")
+        if strategy == "resin":
+            if rotated_node and use_fixed_node:
+                self.info(
+                    f"Register fixed Resin identity: account={rotated_node}, requested={target_requested}, actual={target}",
+                    step="register",
+                )
+            elif rotated_node:
+                self.info(
+                    f"Register Resin rotation: account={rotated_node}, requested={target_requested}, actual={target}",
+                    step="register",
+                )
+        else:
+            if rotated_node and use_fixed_node:
+                self.info(f"Register fixed node: node={rotated_node}, requested={target_requested}, actual={target}", step="register")
+            elif rotated_node:
+                self.info(f"Register node rotation: node={rotated_node}, requested={target_requested}, actual={target}", step="register")
         if internal_restart:
             with self._lock:
                 restart_idx = self._register_watchdog_restarts
@@ -2514,7 +3260,7 @@ class RuntimeManager:
         extra_env = self._build_proxy_env(proxy_info)
         t = threading.Thread(
             target=self._run_subprocess,
-            args=("register", cmd, auto_triggered, target, extra_env, remaining_after_success),
+            args=("register", cmd, auto_triggered, target, extra_env, remaining_after_success, use_fixed_node),
             daemon=True,
         )
         t.start()
@@ -2546,7 +3292,13 @@ class RuntimeManager:
             except Exception:
                 pass
 
-    def start_maintain(self, auto_triggered: bool = False, internal_restart: bool = False, limit: int = 0) -> Dict[str, Any]:
+    def start_maintain(
+        self,
+        auto_triggered: bool = False,
+        internal_restart: bool = False,
+        limit: int = 0,
+        fixed_node_name: Optional[str] = None,
+    ) -> Dict[str, Any]:
         if not MAINTAIN_SCRIPT.exists():
             raise RuntimeError(f"Maintain script not found: {MAINTAIN_SCRIPT}")
         maintain_limit = max(0, int(limit or 0))
@@ -2562,21 +3314,87 @@ class RuntimeManager:
 
         try:
             cfg = get_config()
+            proxy_engine = _normalize_proxy_engine(cfg.get("proxy_engine"))
             rotated_node = ""
-            if bool(cfg.get("easyproxies_enabled", True)) and bool(cfg.get("easyproxies_node_rotation_enabled", True)):
-                requested_units = maintain_limit or int(cfg.get("easyproxies_node_maintain_quota") or 20)
+            requested_fixed_node = str(fixed_node_name or "").strip() if fixed_node_name is not None else ""
+            # Manual/API start should respect request value (including empty to clear),
+            # auto scheduler keeps backward-compatibility by reading persisted config.
+            if fixed_node_name is None:
+                use_fixed_node = str(cfg.get("easyproxies_fixed_node") or "").strip() if proxy_engine == "easyproxies" else ""
+            else:
+                use_fixed_node = requested_fixed_node
+
+            if proxy_engine == "easyproxies":
+                if use_fixed_node:
+                    if not bool(cfg.get("easyproxies_enabled", True)):
+                        raise RuntimeError("Fixed node requires easyproxies_enabled=true")
+                    proxy_info, rotated_node = self._resolve_easyproxies_proxy_forced_node(cfg, use_fixed_node, "maintain")
+                elif bool(cfg.get("easyproxies_enabled", True)) and bool(cfg.get("easyproxies_node_rotation_enabled", True)):
+                    if (
+                        not auto_triggered
+                        and fixed_node_name is not None
+                        and not requested_fixed_node
+                        and not internal_restart
+                    ):
+                        with self._lock:
+                            has_prev_rotation_node = bool(self._easyproxies_rotation_node)
+                        if has_prev_rotation_node:
+                            self._easyproxies_force_switch_next_node(reason="manual-next-maintain")
+                    requested_units = maintain_limit or int(cfg.get("easyproxies_node_maintain_quota") or 20)
+                    try:
+                        proxy_info, rotated_units, rotated_node = self._resolve_easyproxies_proxy_with_rotation(
+                            cfg,
+                            "maintain",
+                            requested_units,
+                        )
+                        maintain_limit = max(1, int(rotated_units or requested_units))
+                    except Exception as exc:
+                        self.warn(f"EasyProxies maintain rotation failed, fallback to runtime strategy: {exc}", step="proxy")
+                        proxy_info = self._resolve_runtime_proxy(cfg, kind="maintain", requested_units=max(1, requested_units))
+                else:
+                    proxy_info = self._resolve_runtime_proxy(
+                        cfg,
+                        kind="maintain",
+                        requested_units=max(1, int(maintain_limit or 1)),
+                    )
+            elif proxy_engine == "resin":
+                requested_units = maintain_limit or int(cfg.get("resin_node_maintain_quota") or 20)
+                if (
+                    not auto_triggered
+                    and fixed_node_name is not None
+                    and not requested_fixed_node
+                    and not internal_restart
+                    and bool(cfg.get("resin_node_rotation_enabled", True))
+                ):
+                    with self._lock:
+                        has_prev_rotation_identity = bool(self._resin_rotation_maintain_account)
+                    if has_prev_rotation_identity:
+                        self._resin_force_switch_next_account("maintain", reason="manual-next-maintain")
                 try:
-                    proxy_info, rotated_units, rotated_node = self._resolve_easyproxies_proxy_with_rotation(
+                    proxy_info, rotated_units, rotated_node = self._resolve_resin_proxy_with_retry(
                         cfg,
                         "maintain",
-                        requested_units,
+                        max(1, requested_units),
+                        fixed_account=use_fixed_node,
                     )
                     maintain_limit = max(1, int(rotated_units or requested_units))
                 except Exception as exc:
-                    self.warn(f"EasyProxies maintain rotation failed, fallback to runtime strategy: {exc}", step="proxy")
-                    proxy_info = self._resolve_runtime_proxy(cfg)
+                    self.warn(f"Resin maintain rotation failed, fallback to runtime strategy: {exc}", step="proxy")
+                    fallback_cfg = dict(cfg)
+                    fallback_cfg["resin_enabled"] = False
+                    fallback_cfg["proxy_engine"] = "auto"
+                    proxy_info = self._resolve_runtime_proxy(
+                        fallback_cfg,
+                        kind="maintain",
+                        requested_units=max(1, requested_units),
+                    )
+                    rotated_node = ""
             else:
-                proxy_info = self._resolve_runtime_proxy(cfg)
+                proxy_info = self._resolve_runtime_proxy(
+                    cfg,
+                    kind="maintain",
+                    requested_units=max(1, int(maintain_limit or 1)),
+                )
         except Exception:
             with self._lock:
                 self.maintain_status = "idle"
@@ -2604,8 +3422,19 @@ class RuntimeManager:
             f"limit={maintain_limit if maintain_limit > 0 else 'all'}",
             step="maintain",
         )
-        if rotated_node:
-            self.info(f"Maintain node rotation: node={rotated_node}, limit={maintain_limit}", step="maintain")
+        if strategy == "resin":
+            if rotated_node and use_fixed_node:
+                self.info(
+                    f"Maintain fixed Resin identity: account={rotated_node}, limit={maintain_limit if maintain_limit > 0 else 'all'}",
+                    step="maintain",
+                )
+            elif rotated_node:
+                self.info(f"Maintain Resin rotation: account={rotated_node}, limit={maintain_limit}", step="maintain")
+        else:
+            if rotated_node and use_fixed_node:
+                self.info(f"Maintain fixed node: node={rotated_node}, limit={maintain_limit if maintain_limit > 0 else 'all'}", step="maintain")
+            elif rotated_node:
+                self.info(f"Maintain node rotation: node={rotated_node}, limit={maintain_limit}", step="maintain")
         if internal_restart:
             with self._lock:
                 restart_idx = self._maintain_watchdog_restarts
@@ -2614,7 +3443,7 @@ class RuntimeManager:
         extra_env = self._build_proxy_env(proxy_info)
         t = threading.Thread(
             target=self._run_subprocess,
-            args=("maintain", cmd, auto_triggered, maintain_limit, extra_env),
+            args=("maintain", cmd, auto_triggered, maintain_limit, extra_env, 0, use_fixed_node),
             daemon=True,
         )
         t.start()
@@ -2677,6 +3506,7 @@ class RuntimeManager:
                 "region": region or "",
                 "updated_at": updated_at,
             },
+            "engine": _normalize_proxy_engine(cfg.get("proxy_engine")),
             "easyproxies": {
                 "enabled": bool(cfg.get("easyproxies_enabled", True)),
                 "api_url": _normalize_http_url(cfg.get("easyproxies_api_url") or ""),
@@ -2688,6 +3518,17 @@ class RuntimeManager:
                 "subscription_url": _normalize_subscription_url(cfg.get("easyproxies_subscription_url") or ""),
                 "last_sub_sync_at": sub_synced_at,
                 "last_sub_refresh_at": sub_refreshed_at,
+                "ok": None,
+            },
+            "resin": {
+                "enabled": bool(cfg.get("resin_enabled", False)),
+                "api_url": _normalize_http_url(cfg.get("resin_api_url") or ""),
+                "proxy_url": _normalize_proxy_endpoint(
+                    cfg.get("resin_proxy_url") or "",
+                    default="http://127.0.0.1:2260",
+                ),
+                "platform_register": str(cfg.get("resin_platform_register") or "").strip(),
+                "platform_maintain": str(cfg.get("resin_platform_maintain") or "").strip(),
                 "ok": None,
             },
             "trace": {"ok": None},
@@ -2734,6 +3575,63 @@ class RuntimeManager:
                     "error": self._repair_possible_mojibake(str(exc)),
                 }
 
+        resin_api_base = _normalize_http_url(cfg.get("resin_api_url") or "").rstrip("/")
+        if bool(cfg.get("resin_enabled", False)) and resin_api_base:
+            try:
+                health_resp = requests.get(f"{resin_api_base}/healthz", timeout=6)
+                if health_resp.status_code >= 400:
+                    raise RuntimeError(f"/healthz HTTP {health_resp.status_code}: {health_resp.text[:120]}")
+                platform_payload = self._resin_api_request(
+                    cfg,
+                    "GET",
+                    "/api/v1/platforms",
+                    timeout=10,
+                    params={"limit": 200, "offset": 0, "sort_by": "name", "sort_order": "asc"},
+                )
+                items = (
+                    platform_payload.get("items")
+                    if isinstance(platform_payload, dict) and isinstance(platform_payload.get("items"), list)
+                    else []
+                )
+                plat_names: Set[str] = set()
+                for item in items:
+                    if not isinstance(item, dict):
+                        continue
+                    name = str(item.get("name") or "").strip()
+                    if name:
+                        plat_names.add(name.lower())
+                reg_name = str(cfg.get("resin_platform_register") or "").strip().lower()
+                maint_name = str(cfg.get("resin_platform_maintain") or "").strip().lower()
+                monitor["resin"] = {
+                    "enabled": bool(cfg.get("resin_enabled", False)),
+                    "api_url": resin_api_base,
+                    "proxy_url": _normalize_proxy_endpoint(
+                        cfg.get("resin_proxy_url") or "",
+                        default="http://127.0.0.1:2260",
+                    ),
+                    "ok": True,
+                    "platform_register": str(cfg.get("resin_platform_register") or "").strip(),
+                    "platform_maintain": str(cfg.get("resin_platform_maintain") or "").strip(),
+                    "platform_total": int(platform_payload.get("total") or len(items))
+                    if isinstance(platform_payload, dict)
+                    else len(items),
+                    "platform_register_exists": bool(reg_name and reg_name in plat_names),
+                    "platform_maintain_exists": bool(maint_name and maint_name in plat_names),
+                }
+            except Exception as exc:
+                monitor["resin"] = {
+                    "enabled": bool(cfg.get("resin_enabled", False)),
+                    "api_url": resin_api_base,
+                    "proxy_url": _normalize_proxy_endpoint(
+                        cfg.get("resin_proxy_url") or "",
+                        default="http://127.0.0.1:2260",
+                    ),
+                    "ok": False,
+                    "error": self._repair_possible_mojibake(str(exc)),
+                    "platform_register": str(cfg.get("resin_platform_register") or "").strip(),
+                    "platform_maintain": str(cfg.get("resin_platform_maintain") or "").strip(),
+                }
+
         if browser_proxy:
             try:
                 trace_text = trace_via_proxy(browser_proxy, timeout=8)
@@ -2757,10 +3655,12 @@ class RuntimeManager:
         return monitor
 
     def status(self) -> Dict[str, Any]:
+        cfg = get_config()
         with self._lock:
             return {
                 "register_status": self.register_status,
                 "maintain_status": self.maintain_status,
+                "proxy_engine": _normalize_proxy_engine(cfg.get("proxy_engine")),
                 "current_proxy": self.current_proxy,
                 "current_proxy_strategy": self.current_proxy_strategy,
                 "current_proxy_upstream": self.current_proxy_upstream,
@@ -2781,6 +3681,12 @@ class RuntimeManager:
                 "easyproxies_rotation_maintain_used": self._easyproxies_rotation_maintain_used,
                 "easyproxies_last_switched_node": self._easyproxies_last_switched_node,
                 "easyproxies_last_switch_at": self._easyproxies_last_switch_at,
+                "resin_rotation_register_account": self._resin_rotation_register_account,
+                "resin_rotation_register_used": self._resin_rotation_register_used,
+                "resin_rotation_maintain_account": self._resin_rotation_maintain_account,
+                "resin_rotation_maintain_used": self._resin_rotation_maintain_used,
+                "resin_last_switched_account": self._resin_last_switched_account,
+                "resin_last_switch_at": self._resin_last_switch_at,
                 "sync_status": self.sync_status,
                 "last_sync_at": self.last_sync_at,
                 "last_sync_ok": self.last_sync_ok,
@@ -2917,24 +3823,20 @@ app = FastAPI(title="Gemini Console", version="1.0.0")
 
 class StartRequest(BaseModel):
     count: int = 1
+    fixed_node: Optional[str] = None
+
+
+class MaintainRequest(BaseModel):
+    fixed_node: Optional[str] = None
 
 
 class ProxyCheckRequest(BaseModel):
     proxy: str
 
 
-class ProxyPoolTestRequest(BaseModel):
-    enabled: bool = True
-    api_url: str = DEFAULT_POOL_API_URL
-    auth_mode: str = DEFAULT_POOL_AUTH_MODE
-    api_key: str = ""
-    count: int = DEFAULT_POOL_COUNT
-    country: str = DEFAULT_POOL_COUNTRY
-    retry_times: int = 3
-
-
 class ConfigRequest(BaseModel):
     proxy: str = ""
+    proxy_engine: str = "easyproxies"
     easyproxies_enabled: bool = True
     easyproxies_listen_proxy: str = "http://127.0.0.1:2323"
     easyproxies_api_url: str = "http://127.0.0.1:7840"
@@ -2950,16 +3852,21 @@ class ConfigRequest(BaseModel):
     easyproxies_node_rotation_enabled: bool = True
     easyproxies_node_register_quota: int = 5
     easyproxies_node_maintain_quota: int = 20
-    proxy_pool_enabled: bool = True
-    proxy_pool_api_url: str = DEFAULT_POOL_API_URL
-    proxy_pool_auth_mode: str = DEFAULT_POOL_AUTH_MODE
-    proxy_pool_api_key: str = ""
-    proxy_pool_count: int = DEFAULT_POOL_COUNT
-    proxy_pool_country: str = DEFAULT_POOL_COUNTRY
-    proxy_pool_retry_times: int = 3
-    proxy_subscription_enabled: bool = False
-    proxy_subscription_url: str = ""
-    proxy_subscription_refresh_minutes: int = 10
+    easyproxies_fixed_node: str = ""
+    resin_enabled: bool = False
+    resin_api_url: str = "http://127.0.0.1:2260"
+    resin_proxy_url: str = "http://127.0.0.1:2260"
+    resin_admin_token: str = ""
+    resin_proxy_token: str = ""
+    resin_platform_register: str = "gemini-register"
+    resin_platform_maintain: str = "gemini-maintain"
+    resin_retry_forever: bool = True
+    resin_retry_times: int = 3
+    resin_retry_interval_seconds: int = 8
+    resin_node_rotation_enabled: bool = True
+    resin_node_register_quota: int = 5
+    resin_node_maintain_quota: int = 20
+    resin_rotation_pool_size: int = 2048
     auto_maintain: bool = False
     maintain_interval_minutes: int = 30
     maintain_interval_hours: float = 4.0
@@ -3030,12 +3937,15 @@ async def api_get_config() -> Dict[str, Any]:
     cfg = get_config()
     masked = dict(cfg)
     easy_pwd = str(masked.get("easyproxies_password") or "")
-    pool_key = str(masked.get("proxy_pool_api_key") or "")
+    resin_admin = str(masked.get("resin_admin_token") or "")
+    resin_proxy = str(masked.get("resin_proxy_token") or "")
     sync_key = str(masked.get("account_sync_api_key") or "")
     masked["easyproxies_password"] = ""
     masked["easyproxies_password_preview"] = _mask_secret(easy_pwd, keep=6)
-    masked["proxy_pool_api_key"] = ""
-    masked["proxy_pool_api_key_preview"] = _mask_secret(pool_key, keep=8)
+    masked["resin_admin_token"] = ""
+    masked["resin_admin_token_preview"] = _mask_secret(resin_admin, keep=8)
+    masked["resin_proxy_token"] = ""
+    masked["resin_proxy_token_preview"] = _mask_secret(resin_proxy, keep=8)
     masked["account_sync_api_key"] = ""
     masked["account_sync_api_key_preview"] = _mask_secret(sync_key, keep=8)
     return masked
@@ -3043,15 +3953,41 @@ async def api_get_config() -> Dict[str, Any]:
 
 @app.post("/api/config")
 async def api_set_config(req: ConfigRequest) -> Dict[str, Any]:
+    prev_cfg = get_config()
     cfg = set_config(req.model_dump())
+    try:
+        rotation_sensitive_keys = (
+            "proxy_engine",
+            "easyproxies_fixed_node",
+            "easyproxies_node_rotation_enabled",
+            "easyproxies_node_register_quota",
+            "easyproxies_node_maintain_quota",
+            "easyproxies_enabled",
+            "resin_node_rotation_enabled",
+            "resin_node_register_quota",
+            "resin_node_maintain_quota",
+            "resin_rotation_pool_size",
+            "resin_platform_register",
+            "resin_platform_maintain",
+            "resin_enabled",
+        )
+        need_reset = any(prev_cfg.get(k) != cfg.get(k) for k in rotation_sensitive_keys)
+        if need_reset:
+            manager._easyproxies_reset_rotation_state(reason="config-updated")
+            manager._resin_reset_rotation_state(reason="config-updated")
+    except Exception:
+        pass
     easy_pwd = str(cfg.get("easyproxies_password") or "")
-    pool_key = str(cfg.get("proxy_pool_api_key") or "")
+    resin_admin = str(cfg.get("resin_admin_token") or "")
+    resin_proxy = str(cfg.get("resin_proxy_token") or "")
     sync_key = str(cfg.get("account_sync_api_key") or "")
     safe = dict(cfg)
     safe["easyproxies_password"] = ""
     safe["easyproxies_password_preview"] = _mask_secret(easy_pwd, keep=6)
-    safe["proxy_pool_api_key"] = ""
-    safe["proxy_pool_api_key_preview"] = _mask_secret(pool_key, keep=8)
+    safe["resin_admin_token"] = ""
+    safe["resin_admin_token_preview"] = _mask_secret(resin_admin, keep=8)
+    safe["resin_proxy_token"] = ""
+    safe["resin_proxy_token_preview"] = _mask_secret(resin_proxy, keep=8)
     safe["account_sync_api_key"] = ""
     safe["account_sync_api_key_preview"] = _mask_secret(sync_key, keep=8)
     manager.success("Configuration saved", step="config")
@@ -3061,7 +3997,11 @@ async def api_set_config(req: ConfigRequest) -> Dict[str, Any]:
 @app.post("/api/start")
 async def api_start(req: StartRequest) -> Dict[str, Any]:
     try:
-        return manager.start_register(max(1, req.count), auto_triggered=False)
+        return manager.start_register(
+            max(1, req.count),
+            auto_triggered=False,
+            fixed_node_name=(str(req.fixed_node).strip() if req.fixed_node is not None else ""),
+        )
     except Exception as exc:
         raise HTTPException(status_code=409, detail=manager._repair_possible_mojibake(str(exc)))
 
@@ -3076,9 +4016,10 @@ async def api_stop() -> Dict[str, str]:
 
 
 @app.post("/api/maintain")
-async def api_maintain() -> Dict[str, Any]:
+async def api_maintain(req: Optional[MaintainRequest] = None) -> Dict[str, Any]:
     try:
-        return manager.start_maintain(auto_triggered=False)
+        fixed_node_name = (str(req.fixed_node).strip() if req and req.fixed_node is not None else "")
+        return manager.start_maintain(auto_triggered=False, fixed_node_name=fixed_node_name)
     except Exception as exc:
         raise HTTPException(status_code=409, detail=manager._repair_possible_mojibake(str(exc)))
 
@@ -3130,6 +4071,19 @@ async def api_easyproxies_test() -> Dict[str, Any]:
     return await run_in_threadpool(manager.test_easyproxies)
 
 
+@app.post("/api/resin/test")
+async def api_resin_test() -> Dict[str, Any]:
+    return await run_in_threadpool(manager.test_resin)
+
+
+@app.get("/api/easyproxies/nodes")
+async def api_easyproxies_nodes() -> Dict[str, Any]:
+    try:
+        return await run_in_threadpool(manager.list_easyproxies_nodes)
+    except Exception as exc:
+        raise HTTPException(status_code=409, detail=manager._repair_possible_mojibake(str(exc)))
+
+
 @app.post("/api/easyproxies/sync-subscription")
 async def api_easyproxies_sync_subscription() -> Dict[str, Any]:
     try:
@@ -3155,101 +4109,6 @@ async def api_check_proxy(req: ProxyCheckRequest) -> Dict[str, Any]:
 @app.get("/api/proxy/monitor")
 async def api_proxy_monitor() -> Dict[str, Any]:
     return await run_in_threadpool(manager.proxy_monitor)
-
-
-@app.post("/api/proxy-pool/test")
-async def api_proxy_pool_test(req: ProxyPoolTestRequest) -> Dict[str, Any]:
-    global_cfg = get_config()
-    retry_times = max(1, min(int(req.retry_times or global_cfg.get("proxy_pool_retry_times") or 3), 10))
-    cfg = {
-        "api_url": str(req.api_url or DEFAULT_POOL_API_URL).strip() or DEFAULT_POOL_API_URL,
-        "auth_mode": str(req.auth_mode or DEFAULT_POOL_AUTH_MODE).strip().lower(),
-        "api_key": str(req.api_key or "").strip() or str(global_cfg.get("proxy_pool_api_key") or "").strip(),
-        "count": max(1, min(int(req.count or DEFAULT_POOL_COUNT), 20)),
-        "country": str(req.country or DEFAULT_POOL_COUNTRY).strip().upper() or DEFAULT_POOL_COUNTRY,
-    }
-    if not req.enabled:
-        return {"ok": False, "error": "Proxy pool disabled"}
-    if not cfg["api_key"]:
-        return {"ok": False, "error": "API Key is empty"}
-    relay_data: Dict[str, Any] = {"ok": False}
-    try:
-        relay_trace = await run_in_threadpool(trace_via_pool_relay, cfg, 10, 2)
-        relay_info = parse_trace(relay_trace)
-        relay_ok, relay_loc, relay_ip = is_location_supported(relay_trace)
-        relay_data = {
-            "ok": True,
-            "relay_url": pool_relay_url_from_fetch_url(cfg["api_url"]),
-            "loc": relay_loc,
-            "ip": relay_ip,
-            "supported": relay_ok,
-            "raw": relay_info,
-        }
-    except Exception as exc:
-        relay_data = {"ok": False, "error": manager._repair_possible_mojibake(str(exc))}
-
-    last_error = ""
-    last_proxy = ""
-    last_trace_info: Dict[str, Any] = {}
-    last_supported: Optional[bool] = None
-    last_loc = ""
-    last_ip = ""
-    last_trace_error = ""
-
-    for attempt in range(1, retry_times + 1):
-        try:
-            proxy = await run_in_threadpool(fetch_proxy_from_pool, cfg, 10, 2, False)
-            last_proxy = proxy
-        except Exception as exc:
-            last_error = manager._repair_possible_mojibake(str(exc))
-            if attempt < retry_times:
-                continue
-            return {
-                "ok": False,
-                "error": f"Failed after {retry_times} retries: {last_error}",
-                "relay": relay_data,
-                "retry_times": retry_times,
-                "attempt": attempt,
-            }
-
-        try:
-            trace_text = await run_in_threadpool(trace_via_proxy, proxy, 10)
-            last_trace_info = parse_trace(trace_text)
-            last_supported, last_loc, last_ip = is_location_supported(trace_text)
-            last_trace_error = ""
-            if last_supported:
-                return {
-                    "ok": True,
-                    "proxy": last_proxy,
-                    "loc": last_loc,
-                    "ip": last_ip,
-                    "supported": last_supported,
-                    "trace": last_trace_info,
-                    "trace_error": None,
-                    "relay": relay_data,
-                    "retry_times": retry_times,
-                    "attempt": attempt,
-                }
-        except Exception as exc:
-            last_trace_error = manager._repair_possible_mojibake(str(exc))
-            last_supported = None
-            last_loc = ""
-            last_ip = ""
-            last_trace_info = {}
-
-    return {
-        "ok": True if last_proxy else False,
-        "proxy": last_proxy or None,
-        "loc": last_loc,
-        "ip": last_ip,
-        "supported": last_supported,
-        "trace": last_trace_info,
-        "trace_error": (last_trace_error or f"Trace check failed after {retry_times} retries") if last_proxy else None,
-        "relay": relay_data,
-        "retry_times": retry_times,
-        "attempt": retry_times,
-        "error": None if last_proxy else (last_error or "fetch failed"),
-    }
 
 
 @app.get("/api/logs")

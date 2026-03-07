@@ -7,13 +7,10 @@
   <link rel="stylesheet" href="/static/style.css" />
 </head>
 <body>
-  <div class="bg-glow bg-glow-a"></div>
-  <div class="bg-glow bg-glow-b"></div>
-
   <header class="topbar">
     <div class="brand">
       <h1>Gemini 控制台</h1>
-      <p>注册 / 维护 / 同步 / EasyProxies 订阅一体化</p>
+      <p>Resin + EasyProxies 双引擎 / 补号 / 维护 / 同步</p>
     </div>
     <div id="headerStatus" class="badge idle">空闲</div>
   </header>
@@ -52,6 +49,127 @@
       <div id="actionMsg" class="hint"></div>
     </section>
 
+    <section class="card wide">
+      <h2>代理引擎与接入配置</h2>
+      <div class="grid config-grid compact">
+        <label>代理引擎
+          <select id="proxyEngine">
+            <option value="easyproxies">EasyProxies</option>
+            <option value="resin">Resin</option>
+            <option value="auto">Auto (Resin 优先)</option>
+          </select>
+        </label>
+        <label>固定代理（兜底）
+          <input id="proxyInput" type="text" placeholder="http://127.0.0.1:7890" />
+        </label>
+      </div>
+
+      <div class="stack-grid">
+        <article class="sub-card">
+          <h3>EasyProxies</h3>
+          <div class="toggle-row">
+            <label><input id="easyProxiesEnabled" type="checkbox" /> 启用 EasyProxies</label>
+            <label><input id="easyProxiesSubscriptionEnabled" type="checkbox" /> 启用订阅同步</label>
+            <label><input id="easyProxiesRefreshBeforeTask" type="checkbox" /> 任务前刷新订阅</label>
+            <label><input id="easyProxiesRetryForever" type="checkbox" /> 连通失败持续重试</label>
+            <label><input id="easyProxiesNodeRotationEnabled" type="checkbox" /> 启用节点配额轮换</label>
+          </div>
+          <div class="grid config-grid compact">
+            <label>监听代理
+              <input id="easyProxiesListenProxy" type="text" placeholder="http://127.0.0.1:2323" />
+            </label>
+            <label>管理地址
+              <input id="easyProxiesApiUrl" type="text" placeholder="http://127.0.0.1:7840" />
+            </label>
+            <label>管理密码
+              <input id="easyProxiesPassword" type="password" placeholder="留空表示不修改" />
+            </label>
+            <label>订阅链接
+              <input id="easyProxiesSubscriptionUrl" type="text" placeholder="https://example.com/subscription" />
+            </label>
+            <label>订阅刷新间隔(分钟)
+              <input id="easyProxiesSubscriptionRefreshMinutes" type="number" min="1" max="1440" value="60" />
+            </label>
+            <label>重试次数
+              <input id="easyProxiesRetryTimes" type="number" min="1" max="60" value="3" />
+            </label>
+            <label>重试间隔(秒)
+              <input id="easyProxiesRetryIntervalSeconds" type="number" min="1" max="300" value="8" />
+            </label>
+            <label>运行中刷新间隔(秒,0=关闭)
+              <input id="easyProxiesRotateIntervalSeconds" type="number" min="0" max="3600" value="120" />
+            </label>
+            <label>固定节点
+              <select id="easyProxiesFixedNode">
+                <option value="">自动选择（池/轮换）</option>
+              </select>
+            </label>
+            <label>每节点补号配额
+              <input id="easyProxiesNodeRegisterQuota" type="number" min="1" max="500" value="5" />
+            </label>
+            <label>每节点维护配额
+              <input id="easyProxiesNodeMaintainQuota" type="number" min="1" max="5000" value="20" />
+            </label>
+          </div>
+        </article>
+
+        <article class="sub-card">
+          <h3>Resin</h3>
+          <div class="toggle-row">
+            <label><input id="resinEnabled" type="checkbox" /> 启用 Resin</label>
+            <label><input id="resinRetryForever" type="checkbox" /> 解析失败持续重试</label>
+            <label><input id="resinNodeRotationEnabled" type="checkbox" /> 启用身份配额轮换</label>
+          </div>
+          <div class="grid config-grid compact">
+            <label>Resin API 地址
+              <input id="resinApiUrl" type="text" placeholder="http://127.0.0.1:2260" />
+            </label>
+            <label>Resin 代理入口
+              <input id="resinProxyUrl" type="text" placeholder="http://127.0.0.1:2260" />
+            </label>
+            <label>Resin 管理 Token
+              <input id="resinAdminToken" type="password" placeholder="留空表示不修改" />
+            </label>
+            <label>Resin 代理 Token
+              <input id="resinProxyToken" type="password" placeholder="留空表示不修改" />
+            </label>
+            <label>补号 Platform
+              <input id="resinPlatformRegister" type="text" value="gemini-register" />
+            </label>
+            <label>维护 Platform
+              <input id="resinPlatformMaintain" type="text" value="gemini-maintain" />
+            </label>
+            <label>重试次数
+              <input id="resinRetryTimes" type="number" min="1" max="60" value="3" />
+            </label>
+            <label>重试间隔(秒)
+              <input id="resinRetryIntervalSeconds" type="number" min="1" max="300" value="8" />
+            </label>
+            <label>每身份补号配额
+              <input id="resinNodeRegisterQuota" type="number" min="1" max="5000" value="5" />
+            </label>
+            <label>每身份维护配额
+              <input id="resinNodeMaintainQuota" type="number" min="1" max="50000" value="20" />
+            </label>
+            <label>身份池大小
+              <input id="resinRotationPoolSize" type="number" min="1" max="50000" value="2048" />
+            </label>
+          </div>
+        </article>
+      </div>
+
+      <div class="actions">
+        <button id="saveConfigBtn" class="btn primary">保存配置</button>
+        <button id="testProxyBtn" class="btn">测试固定代理</button>
+        <button id="testEasyProxiesBtn" class="btn">测试 EasyProxies</button>
+        <button id="testResinBtn" class="btn">测试 Resin</button>
+        <button id="syncEasyProxiesSubBtn" class="btn">同步 EasyProxies 订阅</button>
+        <button id="refreshEasyProxiesNodesBtn" class="btn">刷新节点列表</button>
+        <button id="monitorProxyBtn" class="btn">代理监测</button>
+      </div>
+      <div id="configMsg" class="hint"></div>
+    </section>
+
     <section class="card">
       <h2>账号池状态</h2>
       <div class="grid pool-grid">
@@ -62,62 +180,6 @@
         <div><span class="label">阈值</span><span id="poolThreshold">0</span></div>
         <div><span class="label">缺口</span><span id="poolGap">0</span></div>
       </div>
-    </section>
-
-    <section class="card">
-      <h2>EasyProxies 代理</h2>
-      <div class="grid config-grid">
-        <label>固定代理（兜底）
-          <input id="proxyInput" type="text" placeholder="http://127.0.0.1:7890" />
-        </label>
-        <label>EasyProxies 监听代理
-          <input id="easyProxiesListenProxy" type="text" placeholder="http://127.0.0.1:2323" />
-        </label>
-        <label>EasyProxies 管理地址
-          <input id="easyProxiesApiUrl" type="text" placeholder="http://127.0.0.1:7840" />
-        </label>
-        <label>EasyProxies 管理密码
-          <input id="easyProxiesPassword" type="password" placeholder="留空表示不修改" />
-        </label>
-        <label>订阅链接
-          <input id="easyProxiesSubscriptionUrl" type="text" placeholder="https://example.com/subscription" />
-        </label>
-        <label>订阅刷新间隔(分钟)
-          <input id="easyProxiesSubscriptionRefreshMinutes" type="number" min="1" max="1440" value="60" />
-        </label>
-      </div>
-      <div class="toggle-row">
-        <label><input id="easyProxiesEnabled" type="checkbox" /> 启用 EasyProxies 主代理</label>
-        <label><input id="easyProxiesSubscriptionEnabled" type="checkbox" /> 启用订阅同步</label>
-        <label><input id="easyProxiesRefreshBeforeTask" type="checkbox" /> 任务前同步订阅并刷新</label>
-        <label><input id="easyProxiesRetryForever" type="checkbox" /> 连通失败持续重试</label>
-        <label><input id="easyProxiesNodeRotationEnabled" type="checkbox" /> 启用按节点配额轮换</label>
-      </div>
-      <div class="grid config-grid">
-        <label>EasyProxies 重试次数
-          <input id="easyProxiesRetryTimes" type="number" min="1" max="60" value="3" />
-        </label>
-        <label>EasyProxies 重试间隔(秒)
-          <input id="easyProxiesRetryIntervalSeconds" type="number" min="1" max="300" value="8" />
-        </label>
-        <label>运行中订阅刷新间隔(秒,0=关闭)
-          <input id="easyProxiesRotateIntervalSeconds" type="number" min="0" max="3600" value="120" />
-        </label>
-        <label>每节点补号配额
-          <input id="easyProxiesNodeRegisterQuota" type="number" min="1" max="500" value="5" />
-        </label>
-        <label>每节点维护配额
-          <input id="easyProxiesNodeMaintainQuota" type="number" min="1" max="5000" value="20" />
-        </label>
-      </div>
-      <div class="actions">
-        <button id="saveConfigBtn" class="btn primary">保存配置</button>
-        <button id="testProxyBtn" class="btn">测试固定代理</button>
-        <button id="testEasyProxiesBtn" class="btn">测试 EasyProxies</button>
-        <button id="syncEasyProxiesSubBtn" class="btn">同步订阅到 EasyProxies</button>
-        <button id="monitorProxyBtn" class="btn">代理监测</button>
-      </div>
-      <div id="configMsg" class="hint"></div>
     </section>
 
     <section class="card">
@@ -205,8 +267,8 @@
         </label>
       </div>
       <div class="hint">
-        补号数量逻辑：顶部“补号数量”=手动任务总量；“默认补号数量”=仅用于回填顶部输入框；“每次补号数量”=自动补号单次总量。
-        启用节点配额轮换后，会按“每节点补号配额 / 每节点维护配额”自动切分并切换节点，直到该任务总量或待维护账号处理完成。
+        补号数量逻辑：顶部“补号数量”=手动任务总量；“默认补号数量”=仅用于回填顶部输入框；“每次补号数量”=自动补号单次总量。<br />
+        EasyProxies 轮换按节点配额切分；Resin 轮换按身份配额切分（platform.account），适配大规模节点池。
       </div>
     </section>
 

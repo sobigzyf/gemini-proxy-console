@@ -1,4 +1,28 @@
 ﻿services:
+  resin:
+    image: ghcr.io/resinat/resin:latest
+    container_name: resin
+    restart: unless-stopped
+    environment:
+      TZ: ${TZ:-Asia/Shanghai}
+      RESIN_AUTH_VERSION: ${RESIN_AUTH_VERSION:-V1}
+      RESIN_ADMIN_TOKEN: ${RESIN_ADMIN_TOKEN:-change-me-admin-token}
+      RESIN_PROXY_TOKEN: ${RESIN_PROXY_TOKEN:-change-me-proxy-token}
+      RESIN_LISTEN_ADDRESS: 0.0.0.0
+      RESIN_PORT: 2260
+    ports:
+      - "2260:2260"
+    volumes:
+      - resin-cache:/var/cache/resin
+      - resin-state:/var/lib/resin
+      - resin-log:/var/log/resin
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://127.0.0.1:2260/healthz >/dev/null || exit 1"]
+      interval: 30s
+      timeout: 5s
+      retries: 5
+      start_period: 20s
+
   gemini-console:
     build:
       context: .
@@ -6,24 +30,37 @@
     image: gemini-console:local
     container_name: gemini-console
     restart: unless-stopped
-    network_mode: host
+    depends_on:
+      resin:
+        condition: service_healthy
     env_file:
       - .env
     environment:
-      TZ: Asia/Shanghai
+      TZ: ${TZ:-Asia/Shanghai}
       CHROME_BIN: /usr/bin/chromium
       UC_CLEAR_CACHE_ON_RETRY: "0"
       UC_DOWNLOAD_PROXY_ENABLED: "0"
       USE_XVFB: "1"
       XVFB_WHD: 1920x1080x24
+      PROXY_ENGINE: ${PROXY_ENGINE:-resin}
+      RESIN_ENABLED: ${RESIN_ENABLED:-1}
+      RESIN_API_URL: http://resin:2260
+      RESIN_PROXY_URL: http://resin:2260
+      RESIN_ADMIN_TOKEN: ${RESIN_ADMIN_TOKEN:-change-me-admin-token}
+      RESIN_PROXY_TOKEN: ${RESIN_PROXY_TOKEN:-change-me-proxy-token}
+      RESIN_PLATFORM_REGISTER: ${RESIN_PLATFORM_REGISTER:-gemini-register}
+      RESIN_PLATFORM_MAINTAIN: ${RESIN_PLATFORM_MAINTAIN:-gemini-maintain}
+    ports:
+      - "18423:18423"
     volumes:
       - ./:/app
       - uc-driver-cache:/root/.local/share/undetected_chromedriver
       - chrome-cache:/root/.cache
-    # If host network is not available, switch to explicit port mapping:
-    # ports:
-    #   - "18423:18423"
+    shm_size: "1gb"
 
 volumes:
   uc-driver-cache:
   chrome-cache:
+  resin-cache:
+  resin-state:
+  resin-log:

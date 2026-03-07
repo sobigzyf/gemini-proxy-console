@@ -33,7 +33,9 @@ const DOM = {
   syncNowBtn: $("syncNowBtn"),
   actionMsg: $("actionMsg"),
 
+  proxyEngine: $("proxyEngine"),
   proxyInput: $("proxyInput"),
+
   easyProxiesEnabled: $("easyProxiesEnabled"),
   easyProxiesListenProxy: $("easyProxiesListenProxy"),
   easyProxiesApiUrl: $("easyProxiesApiUrl"),
@@ -45,10 +47,26 @@ const DOM = {
   easyProxiesRetryForever: $("easyProxiesRetryForever"),
   easyProxiesRetryTimes: $("easyProxiesRetryTimes"),
   easyProxiesRetryIntervalSeconds: $("easyProxiesRetryIntervalSeconds"),
+  easyProxiesFixedNode: $("easyProxiesFixedNode"),
   easyProxiesRotateIntervalSeconds: $("easyProxiesRotateIntervalSeconds"),
   easyProxiesNodeRotationEnabled: $("easyProxiesNodeRotationEnabled"),
   easyProxiesNodeRegisterQuota: $("easyProxiesNodeRegisterQuota"),
   easyProxiesNodeMaintainQuota: $("easyProxiesNodeMaintainQuota"),
+
+  resinEnabled: $("resinEnabled"),
+  resinApiUrl: $("resinApiUrl"),
+  resinProxyUrl: $("resinProxyUrl"),
+  resinAdminToken: $("resinAdminToken"),
+  resinProxyToken: $("resinProxyToken"),
+  resinPlatformRegister: $("resinPlatformRegister"),
+  resinPlatformMaintain: $("resinPlatformMaintain"),
+  resinRetryForever: $("resinRetryForever"),
+  resinRetryTimes: $("resinRetryTimes"),
+  resinRetryIntervalSeconds: $("resinRetryIntervalSeconds"),
+  resinNodeRotationEnabled: $("resinNodeRotationEnabled"),
+  resinNodeRegisterQuota: $("resinNodeRegisterQuota"),
+  resinNodeMaintainQuota: $("resinNodeMaintainQuota"),
+  resinRotationPoolSize: $("resinRotationPoolSize"),
 
   autoMaintain: $("autoMaintain"),
   autoRegister: $("autoRegister"),
@@ -85,7 +103,9 @@ const DOM = {
   saveConfigBtn: $("saveConfigBtn"),
   testProxyBtn: $("testProxyBtn"),
   testEasyProxiesBtn: $("testEasyProxiesBtn"),
+  testResinBtn: $("testResinBtn"),
   syncEasyProxiesSubBtn: $("syncEasyProxiesSubBtn"),
+  refreshEasyProxiesNodesBtn: $("refreshEasyProxiesNodesBtn"),
   monitorProxyBtn: $("monitorProxyBtn"),
   configMsg: $("configMsg"),
   logs: $("logs"),
@@ -127,7 +147,79 @@ function formatTs(ts) {
   return d.toLocaleString();
 }
 
+function buildNodeOptionLabel(node) {
+  const name = String(node.name || "").trim();
+  const countryOrRegion = String(node.country || node.region || "-").trim() || "-";
+  const port = Number(node.port || 0) > 0 ? Number(node.port) : "-";
+  const healthy = !!node.available && !!node.initial_check_done && !node.blacklisted;
+  return `${name} (${countryOrRegion}, port=${port}, ${healthy ? "可用" : "不可用"})`;
+}
+
+function applyEasyProxiesNodes(data, preferredNode = "") {
+  if (!DOM.easyProxiesFixedNode) return;
+  const select = DOM.easyProxiesFixedNode;
+  const keepValue = String(preferredNode || select.dataset.pendingValue || select.value || "").trim();
+  const nodes = Array.isArray(data.nodes) ? data.nodes : [];
+  const names = new Set();
+
+  select.innerHTML = "";
+  const autoOpt = document.createElement("option");
+  autoOpt.value = "";
+  autoOpt.textContent = "自动选择（池/轮换）";
+  select.appendChild(autoOpt);
+
+  for (const node of nodes) {
+    const name = String(node?.name || "").trim();
+    if (!name || names.has(name)) continue;
+    names.add(name);
+    const opt = document.createElement("option");
+    opt.value = name;
+    opt.textContent = buildNodeOptionLabel(node);
+    select.appendChild(opt);
+  }
+
+  if (keepValue && !names.has(keepValue)) {
+    const staleOpt = document.createElement("option");
+    staleOpt.value = keepValue;
+    staleOpt.textContent = `${keepValue} (当前配置, 节点列表未返回)`;
+    select.appendChild(staleOpt);
+  }
+
+  select.value = keepValue;
+  select.dataset.pendingValue = keepValue;
+}
+
+async function loadEasyProxiesNodes(preferredNode = "", showSuccessMsg = false) {
+  if (!DOM.easyProxiesFixedNode) return;
+  try {
+    if (DOM.refreshEasyProxiesNodesBtn) {
+      DOM.refreshEasyProxiesNodesBtn.disabled = true;
+    }
+    const data = await requestJSON("/api/easyproxies/nodes");
+    if (!data.ok) {
+      throw new Error(data.error || "unknown");
+    }
+    applyEasyProxiesNodes(data, preferredNode);
+    if (showSuccessMsg) {
+      setMessage(
+        DOM.configMsg,
+        `节点列表已刷新: mode=${data.mode || "-"}, healthy=${data.healthy_nodes || 0}/${data.total_nodes || 0}`
+      );
+    }
+  } catch (err) {
+    const msg = String(err?.message || "");
+    if (showSuccessMsg) {
+      setMessage(DOM.configMsg, `刷新节点列表失败: ${msg || "unknown"}`, true);
+    }
+  } finally {
+    if (DOM.refreshEasyProxiesNodesBtn) {
+      DOM.refreshEasyProxiesNodesBtn.disabled = false;
+    }
+  }
+}
+
 function renderConfig(cfg) {
+  DOM.proxyEngine.value = cfg.proxy_engine || "easyproxies";
   DOM.proxyInput.value = cfg.proxy || "";
 
   DOM.easyProxiesEnabled.checked = cfg.easyproxies_enabled !== false;
@@ -145,6 +237,27 @@ function renderConfig(cfg) {
   DOM.easyProxiesNodeRotationEnabled.checked = cfg.easyproxies_node_rotation_enabled !== false;
   DOM.easyProxiesNodeRegisterQuota.value = cfg.easyproxies_node_register_quota || 5;
   DOM.easyProxiesNodeMaintainQuota.value = cfg.easyproxies_node_maintain_quota || 20;
+
+  if (DOM.easyProxiesFixedNode) {
+    const fixedNode = String(cfg.easyproxies_fixed_node || "").trim();
+    DOM.easyProxiesFixedNode.dataset.pendingValue = fixedNode;
+    DOM.easyProxiesFixedNode.value = fixedNode;
+  }
+
+  DOM.resinEnabled.checked = !!cfg.resin_enabled;
+  DOM.resinApiUrl.value = cfg.resin_api_url || "http://127.0.0.1:2260";
+  DOM.resinProxyUrl.value = cfg.resin_proxy_url || "http://127.0.0.1:2260";
+  DOM.resinAdminToken.placeholder = cfg.resin_admin_token_preview || "留空表示不修改";
+  DOM.resinProxyToken.placeholder = cfg.resin_proxy_token_preview || "留空表示不修改";
+  DOM.resinPlatformRegister.value = cfg.resin_platform_register || "gemini-register";
+  DOM.resinPlatformMaintain.value = cfg.resin_platform_maintain || "gemini-maintain";
+  DOM.resinRetryForever.checked = cfg.resin_retry_forever !== false;
+  DOM.resinRetryTimes.value = cfg.resin_retry_times || 3;
+  DOM.resinRetryIntervalSeconds.value = cfg.resin_retry_interval_seconds || 8;
+  DOM.resinNodeRotationEnabled.checked = cfg.resin_node_rotation_enabled !== false;
+  DOM.resinNodeRegisterQuota.value = cfg.resin_node_register_quota || 5;
+  DOM.resinNodeMaintainQuota.value = cfg.resin_node_maintain_quota || 20;
+  DOM.resinRotationPoolSize.value = cfg.resin_rotation_pool_size || 2048;
 
   DOM.autoMaintain.checked = !!cfg.auto_maintain;
   DOM.autoRegister.checked = !!cfg.auto_register;
@@ -185,6 +298,7 @@ async function loadConfig() {
   try {
     const cfg = await requestJSON("/api/config");
     renderConfig(cfg);
+    await loadEasyProxiesNodes(cfg.easyproxies_fixed_node || "");
   } catch (err) {
     setMessage(DOM.configMsg, `加载配置失败: ${err.message}`, true);
   }
@@ -195,6 +309,7 @@ async function saveConfig() {
 
   const payload = {
     proxy: DOM.proxyInput.value.trim(),
+    proxy_engine: DOM.proxyEngine.value,
 
     easyproxies_enabled: DOM.easyProxiesEnabled.checked,
     easyproxies_listen_proxy: DOM.easyProxiesListenProxy.value.trim(),
@@ -207,14 +322,26 @@ async function saveConfig() {
     easyproxies_retry_forever: DOM.easyProxiesRetryForever.checked,
     easyproxies_retry_times: Number(DOM.easyProxiesRetryTimes.value || 3),
     easyproxies_retry_interval_seconds: Number(DOM.easyProxiesRetryIntervalSeconds.value || 8),
+    easyproxies_fixed_node: DOM.easyProxiesFixedNode?.value.trim() || "",
     easyproxies_rotate_interval_seconds: Number(DOM.easyProxiesRotateIntervalSeconds.value || 120),
     easyproxies_node_rotation_enabled: DOM.easyProxiesNodeRotationEnabled.checked,
     easyproxies_node_register_quota: Number(DOM.easyProxiesNodeRegisterQuota.value || 5),
     easyproxies_node_maintain_quota: Number(DOM.easyProxiesNodeMaintainQuota.value || 20),
 
-    // Disable legacy modes to avoid strategy conflict.
-    proxy_pool_enabled: false,
-    proxy_subscription_enabled: false,
+    resin_enabled: DOM.resinEnabled.checked,
+    resin_api_url: DOM.resinApiUrl.value.trim(),
+    resin_proxy_url: DOM.resinProxyUrl.value.trim(),
+    resin_admin_token: DOM.resinAdminToken.value.trim(),
+    resin_proxy_token: DOM.resinProxyToken.value.trim(),
+    resin_platform_register: DOM.resinPlatformRegister.value.trim(),
+    resin_platform_maintain: DOM.resinPlatformMaintain.value.trim(),
+    resin_retry_forever: DOM.resinRetryForever.checked,
+    resin_retry_times: Number(DOM.resinRetryTimes.value || 3),
+    resin_retry_interval_seconds: Number(DOM.resinRetryIntervalSeconds.value || 8),
+    resin_node_rotation_enabled: DOM.resinNodeRotationEnabled.checked,
+    resin_node_register_quota: Number(DOM.resinNodeRegisterQuota.value || 5),
+    resin_node_maintain_quota: Number(DOM.resinNodeMaintainQuota.value || 20),
+    resin_rotation_pool_size: Number(DOM.resinRotationPoolSize.value || 2048),
 
     auto_maintain: DOM.autoMaintain.checked,
     auto_register: DOM.autoRegister.checked,
@@ -227,7 +354,6 @@ async function saveConfig() {
     guarantee_target_accounts: Number(DOM.guaranteeTargetAccounts.value || 200),
     guarantee_window_hours: Number(DOM.guaranteeWindowHours.value || 4),
     min_accounts: Number(DOM.minAccounts.value || 20),
-    // Keep legacy key aligned with auto_register_batch_size to avoid conflicts.
     max_replenish_per_round: autoBatch,
     register_default_count: Number(DOM.registerDefaultCount.value || 1),
 
@@ -258,7 +384,10 @@ async function saveConfig() {
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify(payload),
     });
+    await loadEasyProxiesNodes(DOM.easyProxiesFixedNode?.value || "");
     DOM.easyProxiesPassword.value = "";
+    DOM.resinAdminToken.value = "";
+    DOM.resinProxyToken.value = "";
     DOM.syncApiKey.value = "";
     setMessage(DOM.configMsg, "配置已保存");
   } catch (err) {
@@ -307,7 +436,7 @@ async function loadStatus() {
     DOM.maintainStatus.textContent = maintainStatus;
     DOM.successCount.textContent = data.success || 0;
     DOM.failCount.textContent = data.fail || 0;
-    DOM.currentProxyStrategy.textContent = data.current_proxy_strategy || "-";
+    DOM.currentProxyStrategy.textContent = data.current_proxy_strategy || data.proxy_engine || "-";
     DOM.currentProxy.textContent = data.current_proxy || "-";
     DOM.currentProxyUpstream.textContent = data.current_proxy_upstream || "-";
     DOM.currentProxyRegion.textContent = data.current_proxy_region || "-";
@@ -347,19 +476,22 @@ async function loadStatus() {
 
 async function startRegister() {
   const count = Math.max(1, Number(DOM.startCount.value || 1));
+  const fixedNode = DOM.proxyEngine.value === "easyproxies"
+    ? (DOM.easyProxiesFixedNode?.value.trim() || "")
+    : "";
   try {
     DOM.startBtn.disabled = true;
     const data = await requestJSON("/api/start", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ count }),
+      body: JSON.stringify({ count, fixed_node: fixedNode }),
     });
     const total = Number(data.target_count || count);
     const segment = Number(data.segment_count || total);
     const remaining = Number(data.remaining_count || 0);
     setMessage(
       DOM.actionMsg,
-      `补号任务已启动: 总量=${total}, 当前分段=${segment}, 剩余=${remaining}, 策略=${data.proxy_strategy || "direct"}, 浏览器代理=${data.proxy || "直连"}, 节点=${data.proxy_node || "-"}`
+      `补号任务已启动: 总量=${total}, 当前分段=${segment}, 剩余=${remaining}, 策略=${data.proxy_strategy || "direct"}, 浏览器代理=${data.proxy || "直连"}, 标识=${data.proxy_node || "-"}`
     );
     await loadStatus();
   } catch (err) {
@@ -383,12 +515,19 @@ async function stopRegister() {
 }
 
 async function runMaintain() {
+  const fixedNode = DOM.proxyEngine.value === "easyproxies"
+    ? (DOM.easyProxiesFixedNode?.value.trim() || "")
+    : "";
   try {
     DOM.maintainBtn.disabled = true;
-    const data = await requestJSON("/api/maintain", { method: "POST" });
+    const data = await requestJSON("/api/maintain", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ fixed_node: fixedNode }),
+    });
     setMessage(
       DOM.actionMsg,
-      `维护任务已启动: 策略=${data.proxy_strategy || "direct"}, 浏览器代理=${data.proxy || "直连"}, 节点=${data.proxy_node || "-"}, limit=${data.limit || "all"}`
+      `维护任务已启动: 策略=${data.proxy_strategy || "direct"}, 浏览器代理=${data.proxy || "直连"}, 标识=${data.proxy_node || "-"}, limit=${data.limit || "all"}`
     );
     await loadStatus();
   } catch (err) {
@@ -501,6 +640,26 @@ async function testEasyProxies() {
   }
 }
 
+async function testResin() {
+  try {
+    DOM.testResinBtn.disabled = true;
+    const data = await requestJSON("/api/resin/test", { method: "POST" });
+    if (!data.ok) {
+      const stage = data.stage ? `(${data.stage}) ` : "";
+      setMessage(DOM.configMsg, `Resin 测试失败: ${stage}${data.error || "unknown"}`, true);
+      return;
+    }
+    setMessage(
+      DOM.configMsg,
+      `Resin 可用: platform=${data.platform || "-"}, account=${data.test_account || "-"}, loc=${data.loc || "?"}, ip=${data.ip || "?"}, leases=${data.active_leases ?? "?"}`
+    );
+  } catch (err) {
+    setMessage(DOM.configMsg, `Resin 测试失败: ${err.message}`, true);
+  } finally {
+    DOM.testResinBtn.disabled = false;
+  }
+}
+
 async function syncEasyProxiesSubscription() {
   try {
     DOM.syncEasyProxiesSubBtn.disabled = true;
@@ -525,7 +684,9 @@ async function monitorProxy() {
     const data = await requestJSON("/api/proxy/monitor");
     const current = data.current || {};
     const easy = data.easyproxies || {};
+    const resin = data.resin || {};
     const trace = data.trace || {};
+    const engine = data.engine || DOM.proxyEngine.value || "-";
 
     const traceMsg = trace.ok
       ? `trace(loc=${trace.loc || "?"}, ip=${trace.ip || "?"}, supported=${trace.supported === false ? "no" : "yes"})`
@@ -533,11 +694,15 @@ async function monitorProxy() {
 
     const easyMsg = easy.ok
       ? `easy(total=${easy.total_nodes || 0}, healthy=${easy.healthy_nodes || 0})`
-      : `easy状态=${easy.ok === false ? "失败" : "未启用"}${easy.error ? `(${easy.error})` : ""}`;
+      : `easy=${easy.ok === false ? `fail(${easy.error || "unknown"})` : "off"}`;
+
+    const resinMsg = resin.ok
+      ? `resin(platforms=${resin.platform_total || 0}, reg=${resin.platform_register_exists ? "ok" : "missing"}, maintain=${resin.platform_maintain_exists ? "ok" : "missing"})`
+      : `resin=${resin.ok === false ? `fail(${resin.error || "unknown"})` : "off"}`;
 
     setMessage(
       DOM.configMsg,
-      `监测: strategy=${current.strategy || "direct"} | browser=${current.browser_proxy || "direct"} | region=${current.region || "-"} | ${easyMsg} | ${traceMsg}`
+      `监测: engine=${engine} | strategy=${current.strategy || "direct"} | browser=${current.browser_proxy || "direct"} | ${easyMsg} | ${resinMsg} | ${traceMsg}`
     );
   } catch (err) {
     setMessage(DOM.configMsg, `代理监测失败: ${err.message}`, true);
@@ -567,7 +732,13 @@ function initEvents() {
   DOM.saveConfigBtn.addEventListener("click", saveConfig);
   DOM.testProxyBtn.addEventListener("click", testProxy);
   DOM.testEasyProxiesBtn.addEventListener("click", testEasyProxies);
+  DOM.testResinBtn.addEventListener("click", testResin);
   DOM.syncEasyProxiesSubBtn.addEventListener("click", syncEasyProxiesSubscription);
+  if (DOM.refreshEasyProxiesNodesBtn) {
+    DOM.refreshEasyProxiesNodesBtn.addEventListener("click", () => {
+      loadEasyProxiesNodes(DOM.easyProxiesFixedNode?.value || "", true);
+    });
+  }
   DOM.monitorProxyBtn.addEventListener("click", monitorProxy);
 
   DOM.startBtn.addEventListener("click", startRegister);

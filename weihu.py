@@ -124,6 +124,17 @@ def _env_flag(name, default=True):
     return raw not in {"0", "false", "no", "off"}
 
 
+def _env_float(name, default, minimum=0.1, maximum=10.0):
+    raw = str(os.getenv(name, "") or "").strip()
+    if not raw:
+        return float(default)
+    try:
+        value = float(raw)
+    except Exception:
+        return float(default)
+    return max(float(minimum), min(float(maximum), value))
+
+
 def _mail_proxy_rotate_retries():
     return _env_int("MAIL_PROXY_ROTATE_RETRIES", MAIL_PROXY_ROTATE_RETRIES_DEFAULT, 0, 10)
 
@@ -221,6 +232,18 @@ class ProxyRotateRetryRequired(RuntimeError):
         except Exception:
             self.elapsed = 0.0
         self.account = account
+
+
+def _should_retry_login_locally(reason):
+    text = str(reason or "").lower()
+    keywords = (
+        "open login/input email failed",
+        "login page",
+        "err_connection_reset",
+        "connection reset",
+        "continue button click failed",
+    )
+    return any(k in text for k in keywords)
 
 
 def _switch_proxy_once():
@@ -937,6 +960,58 @@ def _clear_uc_cache_dir():
         log(f"清理 UC 驱动缓存失败: {e}", "WARN")
 
 
+def _get_uc_driver_backup_path():
+    backup_dir = os.path.join(BASE_DIR, ".uc_driver_cache")
+    return os.path.join(backup_dir, "undetected_chromedriver.exe")
+
+
+def _backup_uc_cache_driver():
+    cache_driver = _get_uc_cache_driver_path()
+    if not cache_driver or not os.path.exists(cache_driver):
+        return
+    backup_path = _get_uc_driver_backup_path()
+    try:
+        os.makedirs(os.path.dirname(backup_path), exist_ok=True)
+        shutil.copy2(cache_driver, backup_path)
+    except Exception as e:
+        log(f"备份 UC 驱动缓存失败: {e}", "WARN")
+
+
+def _restore_uc_cache_driver_if_missing(chrome_major):
+    target = _get_uc_cache_driver_path()
+    if target and os.path.exists(target):
+        return target
+
+    candidates = []
+    backup_path = _get_uc_driver_backup_path()
+    candidates.append(backup_path)
+
+    local_appdata = os.environ.get("LOCALAPPDATA", "")
+    if local_appdata:
+        candidates.append(os.path.join(local_appdata, "undetected_chromedriver", "undetected_chromedriver.exe"))
+
+    path_driver = shutil.which("chromedriver")
+    if path_driver:
+        candidates.append(path_driver)
+
+    for cand in candidates:
+        cand_path = str(cand or "").strip()
+        if not cand_path or not os.path.exists(cand_path):
+            continue
+        cand_major = _get_driver_major_version(cand_path)
+        if chrome_major and cand_major and cand_major != chrome_major:
+            continue
+        try:
+            os.makedirs(os.path.dirname(target), exist_ok=True)
+            shutil.copy2(cand_path, target)
+            log(f"已恢复 UC 缓存驱动: {cand_path} -> {target}")
+            return target
+        except Exception as e:
+            log(f"恢复 UC 缓存驱动失败: {e}", "WARN")
+            continue
+    return target if target and os.path.exists(target) else ""
+
+
 def _should_retry_uc_startup(err_text):
     text = str(err_text or "").lower()
     retry_keywords = (
@@ -1121,10 +1196,22 @@ def create_browser_driver():
         log("Cannot detect Chrome major version, UC default strategy will be used", "WARN")
 
     _cleanup_cached_driver_if_mismatch(chrome_major)
+    restored_cache_driver = _restore_uc_cache_driver_if_missing(chrome_major)
 
     log("Configuring ChromeOptions...")
     options = uc.ChromeOptions()
     options.binary_location = CHROME_BINARY_PATH
+    browser_stability_flags = (
+        "--disable-backgrounding-occluded-windows",
+        "--disable-background-timer-throttling",
+        "--disable-renderer-backgrounding",
+        "--disable-features=CalculateNativeWinOcclusion,BackForwardCache,IntensiveWakeUpThrottling",
+    )
+    for flag in browser_stability_flags:
+        try:
+            options.add_argument(flag)
+        except Exception:
+            pass
     runtime_proxy = _get_runtime_proxy()
     proxy_for_browser = runtime_proxy
     proxy_ext_dir = ""
@@ -1156,6 +1243,9 @@ def create_browser_driver():
     }
     if chrome_major:
         kwargs["version_main"] = chrome_major
+    cache_driver_path = restored_cache_driver or _get_uc_cache_driver_path()
+    if cache_driver_path and os.path.exists(cache_driver_path):
+        kwargs["driver_executable_path"] = cache_driver_path
 
     startup_retries = max(1, min(int(os.getenv("UC_STARTUP_RETRIES", "3") or "3"), 5))
     startup_wait = max(1.0, float(os.getenv("UC_STARTUP_RETRY_WAIT", "3") or "3"))
@@ -1179,6 +1269,7 @@ def create_browser_driver():
         try:
             driver = uc.Chrome(**kwargs)
             log(f"Browser started successfully (elapsed {time.time()-t0:.1f}s)")
+            _backup_uc_cache_driver()
             return driver
         except Exception as e:
             message = str(e)
@@ -1323,36 +1414,100 @@ def _collect_mail_text_candidates(value, out, depth=0, max_depth=5, visited=None
             _collect_mail_text_candidates(item, out, depth + 1, max_depth, visited)
 
 
-def _extract_code_from_text(text):
+_MAIL_CODE_KEYWORD_RE = re.compile(
+    r"(?:验证码|驗證碼|verification(?:\s*code)?|one[-\s]*time(?:\s*code)?|auth(?:entication)?\s*code|security\s*code|confirm(?:ation)?\s*code)",
+    re.IGNORECASE,
+)
+_MAIL_CODE_TOKEN_STOPWORDS = {
+    "GOOGLE",
+    "GEMINI",
+    "VERIFY",
+    "VERIFI",
+    "SIGNIN",
+    "PLEASE",
+    "SECURE",
+    "ACCOUNT",
+}
+
+
+def _extract_code_candidates_from_text(text, max_candidates=6):
     if not text:
-        return None
+        return []
     normalized = re.sub(r"\s+", " ", text.replace("\u200b", "")).strip()
+    if not normalized:
+        return []
+    upper_text = normalized.upper()
+
+    score_map = {}
+    pos_map = {}
+
+    def _bump(token, score, pos):
+        token = str(token or "").strip().upper()
+        if not re.fullmatch(r"[A-Z0-9]{6}", token):
+            return
+        if token in _MAIL_CODE_TOKEN_STOPWORDS:
+            return
+        prev = score_map.get(token, 0)
+        score_map[token] = max(prev, int(score))
+        prev_pos = pos_map.get(token)
+        if prev_pos is None or pos < prev_pos:
+            pos_map[token] = max(0, int(pos))
 
     keyword_patterns = [
         r"(?:验证码|驗證碼|verification(?:\s*code)?|one[-\s]*time(?:\s*code)?|auth(?:entication)?\s*code)\s*(?:is|为|是|:|：|-)?\s*([A-Z0-9]{6})",
         r"\b([A-Z0-9]{6})\b\s*(?:is\s+)?(?:your\s+)?(?:验证码|驗證碼|verification(?:\s*code)?|one[-\s]*time(?:\s*code)?)",
     ]
-    upper_text = normalized.upper()
     for pattern in keyword_patterns:
-        m = re.search(pattern, upper_text, re.IGNORECASE)
-        if m:
-            return m.group(1).upper()
+        for match in re.finditer(pattern, upper_text, re.IGNORECASE):
+            token = match.group(1).upper()
+            pos = match.start(1)
+            score = 160 + (24 if pos < 600 else 0)
+            _bump(token, score, pos)
 
-    # Fallback: only consider tokens containing at least one digit to avoid false positives like VERIFY.
-    for m in re.finditer(r"\b([A-Z0-9]{6})\b", upper_text):
-        token = m.group(1).upper()
-        if token in {"GOOGLE", "GEMINI", "VERIFY", "VERIFI", "SIGNIN", "PLEASE"}:
+    for match in re.finditer(r"\b([A-Z0-9]{6})\b", upper_text):
+        token = match.group(1).upper()
+        if token in _MAIL_CODE_TOKEN_STOPWORDS:
             continue
-        if any(ch.isdigit() for ch in token):
-            return token
-    return None
+        pos = match.start(1)
+        has_digit = any(ch.isdigit() for ch in token)
+        has_alpha = any(ch.isalpha() for ch in token)
+        score = 0
+        if has_digit and has_alpha:
+            score += 100
+        elif has_digit:
+            score += 82
+        elif has_alpha:
+            score += 70
+        window_start = max(0, pos - 56)
+        window_end = min(len(upper_text), pos + 56)
+        if _MAIL_CODE_KEYWORD_RE.search(upper_text[window_start:window_end]):
+            score += 55
+        if pos < 600:
+            score += 18
+        if len(set(token)) <= 2:
+            score -= 30
+        _bump(token, score, pos)
+
+    if not score_map:
+        return []
+
+    ranked = sorted(score_map.items(), key=lambda kv: (-kv[1], pos_map.get(kv[0], 10**9), kv[0]))
+    selected = [token for token, score in ranked if score >= 70]
+    if not selected:
+        selected = [token for token, _ in ranked[:1]]
+    return selected[: max(1, int(max_candidates or 1))]
 
 
-def _extract_code_from_mail(mail_payload):
+def _extract_code_from_text(text):
+    candidates = _extract_code_candidates_from_text(text, max_candidates=1)
+    return candidates[0] if candidates else None
+
+
+def _extract_code_candidates_from_mail(mail_payload, max_candidates=6):
     candidates = []
     _collect_mail_text_candidates(mail_payload, candidates)
     if not candidates:
-        return None
+        return []
 
     # Parse MIME message parts from all possible textual payloads.
     for candidate in list(candidates):
@@ -1379,34 +1534,54 @@ def _extract_code_from_mail(mail_payload):
         except Exception:
             pass
 
+    score_map = {}
+    first_seen_idx = {}
+
+    def _add_token(token, score, idx):
+        token = str(token or "").strip().upper()
+        if not re.fullmatch(r"[A-Z0-9]{6}", token):
+            return
+        if token in _MAIL_CODE_TOKEN_STOPWORDS:
+            return
+        score_map[token] = max(score_map.get(token, 0), int(score))
+        if token not in first_seen_idx:
+            first_seen_idx[token] = int(idx)
+
     # Parse HTML bodies and pull visible text.
-    for candidate in list(candidates):
+    for idx, candidate in enumerate(list(candidates)):
         if not isinstance(candidate, str) or not candidate.strip():
             continue
+        text_bonus = max(0, 70 - (idx * 5))
         try:
             soup = BeautifulSoup(candidate, "html.parser")
             span = soup.find("span", class_="verification-code")
             if span:
                 span_text = span.get_text(" ", strip=True).upper()
-                m = re.search(r"\b([A-Z0-9]{6})\b", span_text)
-                if m:
-                    return m.group(1)
+                match = re.search(r"\b([A-Z0-9]{6})\b", span_text)
+                if match:
+                    _add_token(match.group(1), 420 - idx, idx)
             visible = soup.get_text(" ", strip=True)
             _append_unique_text(candidates, visible)
         except Exception:
             pass
 
-    seen = set()
-    for candidate in candidates:
-        if not isinstance(candidate, str):
-            continue
-        if candidate in seen:
-            continue
-        seen.add(candidate)
-        code = _extract_code_from_text(candidate)
-        if code:
-            return code
-    return None
+        for rank, token in enumerate(_extract_code_candidates_from_text(candidate, max_candidates=max_candidates)):
+            rank_bonus = max(0, 24 - (rank * 5))
+            _add_token(token, 120 + text_bonus + rank_bonus, idx)
+
+    if not score_map:
+        return []
+
+    ranked = sorted(
+        score_map.items(),
+        key=lambda kv: (-kv[1], first_seen_idx.get(kv[0], 10**9), kv[0]),
+    )
+    return [token for token, _ in ranked[: max(1, int(max_candidates or 1))]]
+
+
+def _extract_code_from_mail(mail_payload):
+    candidates = _extract_code_candidates_from_mail(mail_payload, max_candidates=1)
+    return candidates[0] if candidates else None
 
 
 def _parse_mail_timestamp(value):
@@ -1436,7 +1611,14 @@ def _build_mail_signature(mail_item):
     return f"fallback:{ts}|{addr}|{len(subject)}|{preview[:80]}"
 
 
-def _fetch_recent_mail_contents(jwt, expected_email=None, timeout=15, exclude_signatures=None):
+def _fetch_recent_mail_contents(
+    jwt,
+    expected_email=None,
+    timeout=15,
+    exclude_signatures=None,
+    min_timestamp=0.0,
+    allow_missing_timestamp=True,
+):
     if EMAIL_SERVICE is None:
         init_email_service()
 
@@ -1476,10 +1658,18 @@ def _fetch_recent_mail_contents(jwt, expected_email=None, timeout=15, exclude_si
         )
         if expected and row_address and row_address != expected:
             continue
+        row_timestamp = row.get("timestamp") or row.get("createdAt") or row.get("created_at")
+        ts_float = _parse_mail_timestamp(row_timestamp)
+        if min_timestamp > 0:
+            if ts_float > 0 and ts_float < float(min_timestamp):
+                continue
+            if ts_float <= 0 and not allow_missing_timestamp:
+                continue
         candidate = {
             "id": row.get("id"),
             "address": row_address,
-            "timestamp": row.get("timestamp") or row.get("createdAt") or row.get("created_at"),
+            "timestamp": row_timestamp,
+            "_ts": ts_float,
             "subject": row.get("subject"),
             "preview": row.get("snippet") or row.get("preview"),
             "row": row,
@@ -1496,20 +1686,23 @@ def _fetch_recent_mail_contents(jwt, expected_email=None, timeout=15, exclude_si
 
     # 优先按时间戳取最新；时间戳缺失时保留接口返回顺序（通常已按 DESC）。
     candidates.sort(
-        key=lambda x: (_parse_mail_timestamp(x.get("timestamp")), -x.get("_idx", 0)),
+        key=lambda x: (float(x.get("_ts") or 0.0), -x.get("_idx", 0)),
         reverse=True,
     )
     return candidates
 
 
-def _debug_log_mail_and_code(email, latest_mail, code):
+def _debug_log_mail_and_code(email, latest_mail, code, alternatives=None):
     if not DEBUG_MODE:
         return
     mail_id = str(latest_mail.get("id") or "").strip() or "<no-id>"
     ts = latest_mail.get("timestamp")
+    alt_text = ""
+    if alternatives:
+        alt_text = f", alternatives={','.join([str(x) for x in alternatives if x])}"
     log(
         f"[DEBUG] 匹配邮箱 {email} 的邮件: id={mail_id}"
-        f"{', timestamp=' + str(ts) if ts else ''}, code={code or '<未识别>'}"
+        f"{', timestamp=' + str(ts) if ts else ''}, code={code or '<未识别>'}{alt_text}"
     )
 
 
@@ -1543,11 +1736,22 @@ def _manual_triggered():
     return triggered
 
 
+def _clear_manual_input_buffer():
+    if msvcrt is None:
+        return
+    try:
+        while msvcrt.kbhit():
+            msvcrt.getwch()
+    except Exception:
+        return
+
+
 def _prompt_manual_code():
     while True:
         manual = input("\n[INPUT] 请输入手动验证码（6位字母或数字）: ").strip().replace(" ", "").replace("-", "")
         manual = manual.upper()
         if re.fullmatch(r"[A-Z0-9]{6}", manual):
+            _clear_manual_input_buffer()
             return manual
         print("[WARN] 验证码格式无效，请输入6位字母或数字（例如 BZGLHF 或 123456）")
 
@@ -1567,7 +1771,28 @@ def _wait_interval_or_manual(start_time, timeout):
     return None
 
 
-def get_code(email, jwt, timeout=EMAIL_CODE_TIMEOUT_SECONDS):
+def _build_code_payload(primary_code, alternatives=None, source="mail"):
+    primary = _normalize_code_value(primary_code)
+    if not _is_valid_code_token(primary):
+        return None
+    alt_list = []
+    seen = {primary}
+    for item in list(alternatives or []):
+        candidate = _normalize_code_value(item)
+        if not _is_valid_code_token(candidate):
+            continue
+        if candidate in seen:
+            continue
+        seen.add(candidate)
+        alt_list.append(candidate)
+    return {
+        "code": primary,
+        "alternatives": alt_list,
+        "source": str(source or "mail"),
+    }
+
+
+def get_code(email, jwt, timeout=EMAIL_CODE_TIMEOUT_SECONDS, submitted_at_ts=0.0):
     """Fetch verification code from mailbox."""
     init_email_service()
     worker_domain = (getattr(EMAIL_SERVICE, "worker_domain", "") or "").strip()
@@ -1581,32 +1806,48 @@ def get_code(email, jwt, timeout=EMAIL_CODE_TIMEOUT_SECONDS):
     last_warn_signature = ""
     consecutive_fetch_failures = 0
     rotate_threshold = _mail_proxy_rotate_threshold()
+    strict_window_seconds = _env_int("MAIL_CODE_STRICT_WINDOW_SECONDS", 120, 0, 600)
+    timestamp_skew_seconds = _env_int("MAIL_CODE_TIMESTAMP_SKEW_SECONDS", 8, 0, 120)
     while time.time() - start < timeout:
         if _manual_triggered():
             code = _prompt_manual_code()
             log(f"手动验证码: {code}")
-            return code
+            return _build_code_payload(code, alternatives=[], source="manual")
         try:
+            now_ts = time.time()
+            strict_filter = bool(submitted_at_ts) and (
+                strict_window_seconds <= 0 or now_ts <= (float(submitted_at_ts) + strict_window_seconds)
+            )
+            min_timestamp = max(0.0, float(submitted_at_ts) - float(timestamp_skew_seconds)) if strict_filter else 0.0
             mails = _fetch_recent_mail_contents(
                 jwt,
                 expected_email=email,
                 timeout=15,
                 exclude_signatures=discarded_signatures,
+                min_timestamp=min_timestamp,
+                allow_missing_timestamp=not strict_filter,
             )
             consecutive_fetch_failures = 0
             if mails:
                 for mail_item in mails:
-                    code = _extract_code_from_mail(mail_item.get("row"))
-                    _debug_log_mail_and_code(email, mail_item, code)
-                    if code:
-                        if not _debug_wait_for_user_confirmation(email, mail_item, code):
+                    codes = _extract_code_candidates_from_mail(mail_item.get("row"), max_candidates=4)
+                    primary = codes[0] if codes else None
+                    alternatives = codes[1:] if len(codes) > 1 else []
+                    _debug_log_mail_and_code(email, mail_item, primary, alternatives=alternatives)
+                    if primary:
+                        if not _debug_wait_for_user_confirmation(email, mail_item, primary):
                             signature = mail_item.get("signature")
                             if signature:
                                 discarded_signatures.add(signature)
                             log("你已取消本次验证码输入，继续等待下一封邮件", "WARN")
                             continue
-                        log(f"验证码: {code}")
-                        return code
+                        if alternatives:
+                            log(f"验证码候选: primary={primary}, alternatives={','.join(alternatives)}")
+                        else:
+                            log(f"验证码: {primary}")
+                        payload = _build_code_payload(primary, alternatives=alternatives, source="mail")
+                        if payload:
+                            return payload
 
                 latest_mail = mails[0]
                 signature = latest_mail.get("signature") or ""
@@ -1637,7 +1878,7 @@ def get_code(email, jwt, timeout=EMAIL_CODE_TIMEOUT_SECONDS):
                 consecutive_fetch_failures = 0
         manual_code = _wait_interval_or_manual(start, timeout)
         if manual_code:
-            return manual_code
+            return _build_code_payload(manual_code, alternatives=[], source="manual")
     log("验证码超时", "ERR")
     if _mail_timeout_should_rotate():
         raise MailCodeRetryableError(f"verification code timeout ({int(timeout)}s)")
@@ -1723,9 +1964,176 @@ def save_config(email, driver, timeout=10):
 
 def fast_type(element, text, delay=0.02):
     """快速输入文本"""
+    type_scale = _env_float("LOGIN_TYPE_DELAY_SCALE", 1.0, 0.5, 4.0)
+    actual_delay = max(0.005, float(delay) * type_scale)
     for c in text:
         element.send_keys(c)
-        time.sleep(delay)
+        time.sleep(actual_delay)
+
+
+def _normalize_code_value(value):
+    return re.sub(r"[\s-]+", "", str(value or "")).strip().upper()
+
+
+def _is_valid_code_token(value):
+    return bool(re.fullmatch(r"[A-Z0-9]{6}", _normalize_code_value(value)))
+
+
+_CODE_AMBIGUOUS_MAP = {
+    "0": ("O",),
+    "O": ("0",),
+    "1": ("I", "L"),
+    "I": ("1", "L"),
+    "L": ("1", "I", "O"),
+    "5": ("S",),
+    "S": ("5",),
+    "2": ("Z",),
+    "Z": ("2",),
+    "8": ("B",),
+    "B": ("8",),
+}
+
+
+def _build_code_input_candidates(primary_code, extra_codes=None):
+    limit = _env_int("MAIL_CODE_INPUT_VARIANT_LIMIT", 12, 1, 40)
+    base_candidates = []
+    for item in [primary_code] + list(extra_codes or []):
+        code = _normalize_code_value(item)
+        if _is_valid_code_token(code):
+            base_candidates.append(code)
+
+    if not base_candidates:
+        return []
+
+    merged = []
+    seen = set()
+
+    def _add_candidate(item):
+        code = _normalize_code_value(item)
+        if not _is_valid_code_token(code):
+            return
+        if code in seen:
+            return
+        seen.add(code)
+        merged.append(code)
+
+    for code in base_candidates:
+        _add_candidate(code)
+        for idx, ch in enumerate(code):
+            replacements = _CODE_AMBIGUOUS_MAP.get(ch, ())
+            for repl in replacements:
+                _add_candidate(code[:idx] + repl + code[idx + 1 :])
+                if len(merged) >= limit:
+                    return merged[:limit]
+        if len(merged) >= limit:
+            return merged[:limit]
+    return merged[:limit]
+
+
+def _input_value_matches(element, expected):
+    try:
+        actual = element.get_attribute("value")
+    except Exception:
+        return False
+    return _normalize_code_value(actual) == _normalize_code_value(expected)
+
+
+def _set_input_value_js(driver, element, value):
+    try:
+        return bool(
+            driver.execute_script(
+                "var el = arguments[0];"
+                "var nextVal = String(arguments[1] == null ? '' : arguments[1]);"
+                "if (!el) { return false; }"
+                "try { el.focus(); } catch (e) {}"
+                "var proto = Object.getPrototypeOf(el);"
+                "var descriptor = (proto && Object.getOwnPropertyDescriptor(proto, 'value'))"
+                " || Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value')"
+                " || Object.getOwnPropertyDescriptor(HTMLTextAreaElement.prototype, 'value');"
+                "if (descriptor && descriptor.set) { descriptor.set.call(el, nextVal); }"
+                "else { el.value = nextVal; }"
+                "try { if (typeof el.setSelectionRange === 'function') {"
+                "el.setSelectionRange(nextVal.length, nextVal.length); } } catch (e) {}"
+                "el.dispatchEvent(new Event('input', {bubbles:true}));"
+                "el.dispatchEvent(new Event('change', {bubbles:true}));"
+                "return String(el.value == null ? '' : el.value) === nextVal;",
+                element,
+                value,
+            )
+        )
+    except Exception:
+        return False
+
+
+def _input_code_with_global_js(driver, code):
+    try:
+        result = driver.execute_script(
+            "var code = String(arguments[0] == null ? '' : arguments[0]).trim();"
+            "if (!code) { return {ok:false, mode:'empty'}; }"
+            "var norm = function(v){ return String(v == null ? '' : v).replace(/[\\s-]+/g,'').toUpperCase(); };"
+            "var setVal = function(el, val){"
+            "if (!el) { return false; }"
+            "try { el.focus(); } catch (e) {}"
+            "var proto = Object.getPrototypeOf(el);"
+            "var descriptor = (proto && Object.getOwnPropertyDescriptor(proto, 'value'))"
+            " || Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value')"
+            " || Object.getOwnPropertyDescriptor(HTMLTextAreaElement.prototype, 'value');"
+            "if (descriptor && descriptor.set) { descriptor.set.call(el, val); }"
+            "else { el.value = val; }"
+            "try { if (typeof el.setSelectionRange === 'function') {"
+            "el.setSelectionRange(val.length, val.length); } } catch (e) {}"
+            "el.dispatchEvent(new Event('input', {bubbles:true}));"
+            "el.dispatchEvent(new Event('change', {bubbles:true}));"
+            "return norm(el.value) === norm(val);"
+            "};"
+            "var selectors = ["
+            "'input[name=\"pinInput\"]',"
+            "'input[autocomplete=\"one-time-code\"]',"
+            "'input[maxlength=\"6\"]',"
+            "'input[type=\"tel\"]',"
+            "'input[inputmode=\"numeric\"]',"
+            "'input[aria-label*=\"verification\" i]',"
+            "'input[aria-label*=\"code\" i]'"
+            "];"
+            "var candidates = [];"
+            "var seen = new Set();"
+            "for (var i = 0; i < selectors.length; i++) {"
+            "var els = [];"
+            "try { els = document.querySelectorAll(selectors[i]); } catch (e) { els = []; }"
+            "for (var j = 0; j < els.length; j++) {"
+            "var el = els[j];"
+            "if (!seen.has(el)) { seen.add(el); candidates.push(el); }"
+            "}"
+            "}"
+            "for (var k = 0; k < candidates.length; k++) {"
+            "var target = candidates[k];"
+            "if (!target || target.disabled) { continue; }"
+            "var maxlength = Number(target.getAttribute('maxlength') || 0);"
+            "if (maxlength === 1) { continue; }"
+            "if (setVal(target, code)) { return {ok:true, mode:'single'}; }"
+            "}"
+            "var cells = [];"
+            "try {"
+            "cells = Array.prototype.slice.call(document.querySelectorAll('input[maxlength=\"1\"]'))"
+            ".filter(function(el){ return !!el && !el.disabled; });"
+            "} catch (e) { cells = []; }"
+            "if (cells.length >= 4) {"
+            "var n = Math.min(code.length, cells.length);"
+            "var composed = '';"
+            "for (var idx = 0; idx < n; idx++) {"
+            "setVal(cells[idx], code.charAt(idx));"
+            "composed += String(cells[idx].value || '');"
+            "}"
+            "if (norm(composed) === norm(code.slice(0, n))) { return {ok:true, mode:'cells'}; }"
+            "}"
+            "return {ok:false, mode:'none'};",
+            code,
+        )
+    except Exception:
+        return False
+    if isinstance(result, dict):
+        return bool(result.get("ok"))
+    return bool(result)
 
 
 def _safe_quit_driver(driver):
@@ -1807,6 +2215,88 @@ def _login_page_diag(driver):
     return f"url={url or '-'}, title={title or '-'}, html={len(html)}, err={err_mark or '-'}"
 
 
+def _collect_login_url_candidates():
+    candidates = [
+        LOGIN_URL,
+        "https://auth.business.gemini.google/login",
+        "https://accounts.google.com/ServiceLogin?continue=https%3A%2F%2Fbusiness.gemini.google%2F",
+        "https://accounts.google.com/",
+    ]
+    fallback_raw = str(os.getenv("LOGIN_URL_FALLBACKS", "") or "")
+    if fallback_raw:
+        for token in re.split(r"[\r\n,;]+", fallback_raw):
+            value = str(token or "").strip()
+            if value:
+                candidates.append(value)
+    ordered = []
+    seen = set()
+    for url in candidates:
+        value = str(url or "").strip()
+        if not value or value in seen:
+            continue
+        ordered.append(value)
+        seen.add(value)
+    return ordered
+
+
+def _open_login_page_with_retries(driver, step_sleep_scale, page_ready_timeout):
+    nav_retries = _env_int("LOGIN_NAV_RETRIES", 3, 1, 8)
+    nav_retry_sleep = _env_float("LOGIN_NAV_RETRY_SLEEP", 1.0, 0.1, 10.0)
+    candidates = _collect_login_url_candidates()
+    last_err = ""
+
+    for attempt in range(1, nav_retries + 1):
+        target_url = candidates[(attempt - 1) % len(candidates)]
+        try:
+            try:
+                driver.set_page_load_timeout(max(15, int(page_ready_timeout) + 5))
+            except Exception:
+                pass
+            driver.get(target_url)
+            time.sleep(1.0 * step_sleep_scale)
+            end_at = time.time() + page_ready_timeout
+            while time.time() < end_at:
+                try:
+                    ready_state = str(driver.execute_script("return document.readyState") or "").lower()
+                    if ready_state in {"interactive", "complete"}:
+                        break
+                except Exception:
+                    pass
+                time.sleep(0.2)
+
+            current_url = str(getattr(driver, "current_url", "") or "")
+            try:
+                page_source = str(driver.page_source or "")
+            except Exception:
+                page_source = ""
+            page_hint = page_source.lower()
+            if (
+                "proxy" in page_hint and "authentication" in page_hint
+            ) or ("要求提供用户名和密码" in page_source):
+                raise RuntimeError(
+                    f"proxy auth prompt detected ({_login_page_diag(driver)})"
+                )
+            if "err_connection_reset" in page_hint or "err_connection_closed" in page_hint:
+                raise RuntimeError(f"login page network error ({_login_page_diag(driver)})")
+            if "about:blank" in current_url.lower() or "chrome-error://" in current_url.lower() or len(page_source) < 500:
+                raise RuntimeError(
+                    f"login page blank/incomplete ({_login_page_diag(driver)})"
+                )
+            if attempt > 1:
+                log(f"登录页重试成功: attempt={attempt}/{nav_retries}, url={target_url}")
+            return
+        except Exception as exc:
+            last_err = str(exc)
+            retryable = _is_retryable_proxy_runtime_error(exc, driver)
+            if attempt < nav_retries and retryable:
+                log(f"登录页打开失败，准备重试 {attempt}/{nav_retries}: {last_err}", "WARN")
+                time.sleep(nav_retry_sleep * attempt)
+                continue
+            raise
+
+    raise RuntimeError(f"open login page failed after retries: {last_err or 'unknown'}")
+
+
 def _try_dismiss_login_overlays(driver):
     button_locators = (
         (By.XPATH, "//button[.//span[contains(.,'Accept all')] or contains(.,'Accept all')]"),
@@ -1830,33 +2320,19 @@ def _try_dismiss_login_overlays(driver):
 
 
 def _open_login_and_submit_email(driver, wait, email):
-    driver.get(LOGIN_URL)
-    time.sleep(1.0)
-    for _ in range(20):
-        try:
-            if str(driver.execute_script("return document.readyState") or "").lower() == "complete":
-                break
-        except Exception:
-            pass
-        time.sleep(0.2)
+    # Slow network guardrails (all values can be tuned via env).
+    page_ready_timeout = _env_int("LOGIN_PAGE_READY_TIMEOUT", 20, 5, 120)
+    email_input_timeout = _env_int("LOGIN_EMAIL_INPUT_TIMEOUT", 60, 15, 180)
+    continue_btn_timeout = _env_int("LOGIN_CONTINUE_BTN_TIMEOUT", 45, 10, 180)
+    step_sleep_scale = _env_float("LOGIN_STEP_SLEEP_SCALE", 1.0, 0.5, 4.0)
+
+    _open_login_page_with_retries(
+        driver,
+        step_sleep_scale=step_sleep_scale,
+        page_ready_timeout=page_ready_timeout,
+    )
 
     _try_dismiss_login_overlays(driver)
-    current_url = str(getattr(driver, "current_url", "") or "")
-    try:
-        page_source = str(driver.page_source or "")
-    except Exception:
-        page_source = ""
-    page_hint = page_source.lower()
-    if (
-        "proxy" in page_hint and "authentication" in page_hint
-    ) or ("要求提供用户名和密码" in page_source):
-        raise RuntimeError(
-            f"proxy auth prompt detected ({_login_page_diag(driver)})"
-        )
-    if "about:blank" in current_url.lower() or "chrome-error://" in current_url.lower() or len(page_source) < 500:
-        raise RuntimeError(
-            f"login page blank/incomplete ({_login_page_diag(driver)})"
-        )
 
     log("输入邮箱...")
     email_locators = (
@@ -1867,7 +2343,7 @@ def _open_login_and_submit_email(driver, wait, email):
         (By.XPATH, XPATH["email_input"]),
     )
     try:
-        inp = _wait_clickable_any(driver, email_locators, timeout=30)
+        inp = _wait_clickable_any(driver, email_locators, timeout=email_input_timeout)
         inp.click()
         inp.clear()
         fast_type(inp, email)
@@ -1897,7 +2373,7 @@ def _open_login_and_submit_email(driver, wait, email):
             )
 
     log(f"邮箱: {email}")
-    time.sleep(0.5)
+    time.sleep(0.5 * step_sleep_scale)
     continue_locators = (
         (By.ID, "identifierNext"),
         (By.XPATH, "//div[@id='identifierNext']//button"),
@@ -1905,14 +2381,19 @@ def _open_login_and_submit_email(driver, wait, email):
         (By.XPATH, XPATH["continue_btn"]),
     )
     try:
-        btn = _wait_clickable_any(driver, continue_locators, timeout=20)
+        btn = _wait_clickable_any(driver, continue_locators, timeout=continue_btn_timeout)
         driver.execute_script("arguments[0].click();", btn)
     except Exception as exc:
         raise RuntimeError(f"continue button click failed: {exc}; diag={_login_page_diag(driver)}") from None
-    log("点击继续")
+    time.sleep(0.6 * step_sleep_scale)
+    log(f"点击继续 (email_timeout={email_input_timeout}s, continue_timeout={continue_btn_timeout}s)")
 
 
-def _input_verification_code(driver, wait, code):
+def _input_verification_code_once(driver, wait, code):
+    code = _normalize_code_value(code)
+    if not _is_valid_code_token(code):
+        return False
+
     selectors = (
         "input[name='pinInput']",
         "input[autocomplete='one-time-code']",
@@ -1920,56 +2401,192 @@ def _input_verification_code(driver, wait, code):
         "input[type='tel']",
         "input[inputmode='numeric']",
     )
-    for sel in selectors:
+    input_timeout = _env_int("LOGIN_CODE_INPUT_TIMEOUT", 12, 4, 90)
+    end_at = time.time() + input_timeout
+
+    while time.time() < end_at:
+        located_any = False
+        for sel in selectors:
+            try:
+                fields = driver.find_elements(By.CSS_SELECTOR, sel)
+            except Exception:
+                fields = []
+            for field in fields:
+                if not field:
+                    continue
+                try:
+                    if not field.is_displayed() or not field.is_enabled():
+                        continue
+                except Exception:
+                    continue
+                located_any = True
+                try:
+                    field.click()
+                    time.sleep(0.05)
+                except Exception:
+                    pass
+                try:
+                    field.clear()
+                except Exception:
+                    pass
+                try:
+                    fast_type(field, code, 0.05)
+                except Exception:
+                    pass
+                if _input_value_matches(field, code):
+                    return True
+                if _set_input_value_js(driver, field, code) and _input_value_matches(field, code):
+                    log(f"验证码输入改用 JS 回填: {sel}", "WARN")
+                    return True
+
         try:
-            field = wait.until(EC.presence_of_element_located((By.CSS_SELECTOR, sel)))
-            if not field:
-                continue
-            try:
-                field.click()
-                time.sleep(0.1)
-            except Exception:
-                pass
-            try:
-                field.clear()
-            except Exception:
-                pass
-            fast_type(field, code, 0.05)
-            return True
-        except Exception:
-            continue
-
-    try:
-        span = driver.find_element(By.CSS_SELECTOR, "span[data-index='0']")
-        span.click()
-        time.sleep(0.2)
-        driver.switch_to.active_element.send_keys(code)
-        return True
-    except Exception:
-        pass
-
-    try:
-        otp_inputs = [
-            el
-            for el in driver.find_elements(By.CSS_SELECTOR, "input[maxlength='1']")
-            if el.is_displayed() and el.is_enabled()
-        ]
-        if len(otp_inputs) >= 6:
-            for idx, ch in enumerate(code[:6]):
-                otp_inputs[idx].click()
-                otp_inputs[idx].send_keys(ch)
-            return True
-    except Exception:
-        pass
-
-    try:
-        active = driver.switch_to.active_element
-        if active:
+            span = driver.find_element(By.CSS_SELECTOR, "span[data-index='0']")
+            span.click()
+            time.sleep(0.1)
+            active = driver.switch_to.active_element
             active.send_keys(code)
-            return True
-    except Exception:
-        pass
+            if _input_value_matches(active, code):
+                return True
+            if _set_input_value_js(driver, active, code) and _input_value_matches(active, code):
+                log("验证码输入改用 JS 回填: active_element", "WARN")
+                return True
+            located_any = True
+        except Exception:
+            pass
+
+        try:
+            otp_inputs = [
+                el
+                for el in driver.find_elements(By.CSS_SELECTOR, "input[maxlength='1']")
+                if el.is_displayed() and el.is_enabled()
+            ]
+            if len(otp_inputs) >= 6:
+                located_any = True
+                for idx, ch in enumerate(code[:6]):
+                    try:
+                        otp_inputs[idx].click()
+                        otp_inputs[idx].send_keys(ch)
+                    except Exception:
+                        pass
+                typed = "".join(str(el.get_attribute("value") or "").strip() for el in otp_inputs[:6])
+                if _normalize_code_value(typed) == _normalize_code_value(code[:6]):
+                    return True
+                js_ok = True
+                for idx, ch in enumerate(code[:6]):
+                    if not _set_input_value_js(driver, otp_inputs[idx], ch):
+                        js_ok = False
+                typed = "".join(str(el.get_attribute("value") or "").strip() for el in otp_inputs[:6])
+                if js_ok and _normalize_code_value(typed) == _normalize_code_value(code[:6]):
+                    log("验证码分格输入改用 JS 回填", "WARN")
+                    return True
+        except Exception:
+            pass
+
+        try:
+            active = driver.switch_to.active_element
+            if active:
+                located_any = True
+                try:
+                    active.send_keys(code)
+                except Exception:
+                    pass
+                if _input_value_matches(active, code):
+                    return True
+                if _set_input_value_js(driver, active, code) and _input_value_matches(active, code):
+                    log("验证码输入改用 JS 回填: 最后兜底", "WARN")
+                    return True
+        except Exception:
+            pass
+
+        try:
+            if _input_code_with_global_js(driver, code):
+                log("验证码输入改用全局 JS 回填", "WARN")
+                return True
+        except Exception:
+            pass
+
+        time.sleep(0.2 if located_any else 0.35)
     return False
+
+
+def _input_verification_code(driver, wait, code, extra_codes=None):
+    code_candidates = _build_code_input_candidates(code, extra_codes=extra_codes)
+    if not code_candidates:
+        return False
+    primary = code_candidates[0]
+    if len(code_candidates) > 1:
+        log(f"验证码候选尝试: primary={primary}, variants={','.join(code_candidates[1:])}")
+    for idx, candidate in enumerate(code_candidates, start=1):
+        if _input_verification_code_once(driver, wait, candidate):
+            if candidate != primary:
+                log(f"验证码输入采用候选码: {candidate} (primary={primary})", "WARN")
+            return True
+        if idx < len(code_candidates):
+            log(
+                f"验证码候选尝试失败，继续下一个 ({idx}/{len(code_candidates)}): {candidate}",
+                "WARN",
+            )
+    log(
+        f"验证码写入失败: primary={primary}, tried={','.join(code_candidates)}",
+        "ERR",
+    )
+    return False
+
+
+def _click_verify_button(driver):
+    click_timeout = _env_int("LOGIN_VERIFY_CLICK_TIMEOUT", 18, 5, 120)
+    end_at = time.time() + click_timeout
+    locators = (
+        (By.XPATH, XPATH["verify_btn"]),
+        (By.ID, "totpNext"),
+        (By.XPATH, "//button[@type='submit']"),
+        (By.XPATH, "//button[.//span[contains(.,'Verify') or contains(.,'验证') or contains(.,'继续') or contains(.,'Next')]]"),
+    )
+    while time.time() < end_at:
+        for by, locator in locators:
+            try:
+                elements = driver.find_elements(by, locator)
+            except Exception:
+                continue
+            for btn in elements:
+                if btn is None:
+                    continue
+                try:
+                    if not btn.is_displayed() or not btn.is_enabled():
+                        continue
+                    driver.execute_script("arguments[0].click();", btn)
+                    return True
+                except Exception:
+                    continue
+        try:
+            active = driver.switch_to.active_element
+            if active:
+                active.send_keys("\n")
+                return True
+        except Exception:
+            pass
+        time.sleep(0.2)
+    return False
+
+
+def _wait_post_verify_result(driver, timeout_seconds):
+    end_at = time.time() + max(10, int(timeout_seconds))
+    last_url = ""
+    while time.time() < end_at:
+        try:
+            current_url = str(driver.current_url or "")
+        except Exception:
+            current_url = ""
+        if current_url:
+            last_url = current_url
+        lower = current_url.lower()
+        if "business.gemini.google" in lower and "/cid/" in lower:
+            return "workspace", current_url
+        if "signin-error" in lower:
+            return "signin_error", current_url
+        time.sleep(0.5)
+    return "timeout", last_url
+
 
 def login_existing_account(driver):
     """登录单个现有账号"""
@@ -1997,9 +2614,10 @@ def login_existing_account(driver):
 
     # 4. 获取验证码
     log(f"邮箱已提交，等待 {EMAIL_SUBMIT_WAIT_SECONDS}s 后开始拉取验证码")
+    submitted_at_ts = time.time()
     time.sleep(EMAIL_SUBMIT_WAIT_SECONDS)
     try:
-        code = get_code(email, jwt, timeout=EMAIL_CODE_TIMEOUT_SECONDS)
+        code_payload = get_code(email, jwt, timeout=EMAIL_CODE_TIMEOUT_SECONDS, submitted_at_ts=submitted_at_ts)
     except MailCodeRetryableError as exc:
         raise ProxyRotateRetryRequired(
             reason=str(exc),
@@ -2007,13 +2625,27 @@ def login_existing_account(driver):
             elapsed=time.time() - start_time,
             account=mail_account,
         ) from None
-    if not code: return email, False, None, time.time() - start_time
+    code = ""
+    code_alternatives = []
+    if isinstance(code_payload, dict):
+        code = _normalize_code_value(code_payload.get("code"))
+        code_alternatives = [
+            _normalize_code_value(item)
+            for item in list(code_payload.get("alternatives") or [])
+            if _is_valid_code_token(item)
+        ]
+    else:
+        code = _normalize_code_value(code_payload)
+    if not _is_valid_code_token(code):
+        return email, False, None, time.time() - start_time
 
     # 5. 输入验证码
     time.sleep(1)
     log(f"输入验证码: {code}")
+    if code_alternatives:
+        log(f"验证码备选: {','.join(code_alternatives)}")
     try:
-        if not _input_verification_code(driver, wait, code):
+        if not _input_verification_code(driver, wait, code, extra_codes=code_alternatives):
             raise RuntimeError("no supported verification input element found")
     except Exception as e:
         if _is_retryable_proxy_runtime_error(e, driver):
@@ -2028,24 +2660,27 @@ def login_existing_account(driver):
 
     # 6. 点击验证
     time.sleep(0.5)
-    try:
-        vbtn = driver.find_element(By.XPATH, XPATH["verify_btn"])
-        driver.execute_script("arguments[0].click();", vbtn)
-    except:
-        for btn in driver.find_elements(By.TAG_NAME, "button"):
-            if '验证' in btn.text: driver.execute_script("arguments[0].click();", btn); break
+    if not _click_verify_button(driver):
+        log("点击验证失败：未找到可点击的验证按钮", "WARN")
+        return email, False, None, time.time() - start_time
     log("点击验证")
 
     # 7. 等待进入工作台（现有账号无需填写姓名）
     log("等待工作台...")
-    for _ in range(40):  # 最多等40秒
-        time.sleep(1)
-        url = driver.current_url
-        if 'business.gemini.google' in url and '/cid/' in url:
-            log(f"已进入工作台: {url}")
-            break
+    post_verify_timeout = _env_int("LOGIN_POST_VERIFY_TIMEOUT", 40, 10, 240)
+    stage, post_verify_url = _wait_post_verify_result(driver, post_verify_timeout)
+    if stage != "workspace":
+        if stage == "timeout" and _click_verify_button(driver):
+            log("验证码后未跳转，已再次点击验证并继续等待", "WARN")
+            stage, post_verify_url = _wait_post_verify_result(driver, max(15, post_verify_timeout // 2))
+        if stage != "workspace":
+            if stage == "signin_error":
+                log(f"验证码后进入 signin-error，跳过: {post_verify_url}", "WARN")
+            else:
+                log(f"验证码后未跳转到带 cid 的页面，当前: {post_verify_url or '-'}", "WARN")
+            return email, False, None, time.time() - start_time
     else:
-        log(f"未跳转到带 cid 的页面，当前: {driver.current_url}", "WARN")
+        log(f"已进入工作台: {post_verify_url}")
 
     # 8. 保存配置
     elapsed = time.time() - start_time
@@ -2117,10 +2752,13 @@ def main(debug=False, proxy="", limit=0):
     total_time = 0
     times = []
     mail_rotate_retries = _mail_proxy_rotate_retries()
+    local_login_retries = _env_int("LOGIN_LOCAL_RETRIES", 2, 0, 10)
+    local_login_retry_sleep = _env_float("LOGIN_LOCAL_RETRY_SLEEP", 1.2, 0.1, 10.0)
 
     for i in range(task_count):
         print(f"\n{'#'*40}\n登录 {i+1}/{task_count}\n{'#'*40}\n")
         rotate_retry_count = 0
+        local_retry_count = 0
 
         while True:
             # 确保 driver 有效
@@ -2167,6 +2805,18 @@ def main(debug=False, proxy="", limit=0):
                 break
             except ProxyRotateRetryRequired as rotate_exc:
                 total_time += rotate_exc.elapsed
+                if _should_retry_login_locally(rotate_exc.reason) and local_retry_count < local_login_retries:
+                    local_retry_count += 1
+                    if rotate_exc.account:
+                        EXISTING_ACCOUNTS.insert(0, rotate_exc.account)
+                    log(
+                        f"登录链路本地重试（不切换代理） {local_retry_count}/{local_login_retries}: {rotate_exc.reason}",
+                        "WARN",
+                    )
+                    _safe_quit_driver(driver)
+                    driver = None
+                    time.sleep(local_login_retry_sleep * local_retry_count)
+                    continue
                 if rotate_retry_count >= mail_rotate_retries:
                     log(
                         f"可重试代理异常已达最大轮换重试次数: {mail_rotate_retries}, reason={rotate_exc.reason}",
