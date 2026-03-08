@@ -2652,6 +2652,7 @@ class RuntimeManager:
                 "无法访问此网站",
                 "open login/input email failed",
                 "login page blank/incomplete",
+                "proxy auth prompt detected",
                 "nonetype' object has no attribute 'is_displayed'",
                 "stacktrace:",
                 "browser startup failed",
@@ -2718,7 +2719,7 @@ class RuntimeManager:
                     if m_item:
                         self._enqueue_item_sync("maintain", m_item.group(1), auto_triggered)
 
-                if run_strategy == "easyproxies":
+                if run_strategy in {"easyproxies", "resin"}:
                     lower_line = line.lower()
                     if any(k in lower_line for k in proxy_fail_guard_keywords):
                         proxy_related_error_seen = True
@@ -2740,10 +2741,11 @@ class RuntimeManager:
                                     f"pausing {proxy_fail_guard_pause_seconds}s before restart",
                                     step=kind,
                                 )
-                                try:
-                                    self._refresh_easyproxies_runtime(cfg, reason=f"proxy-guard-{kind}")
-                                except Exception:
-                                    pass
+                                if run_strategy == "easyproxies":
+                                    try:
+                                        self._refresh_easyproxies_runtime(cfg, reason=f"proxy-guard-{kind}")
+                                    except Exception:
+                                        pass
                                 try:
                                     proc.terminate()
                                 except Exception:
@@ -2754,28 +2756,29 @@ class RuntimeManager:
                                 self.info("Proxy fail streak reset", step=kind)
                             proxy_fail_streak = 0
 
-                    if ("browser proxy precheck failed" in lower_line) or ("触发代理轮换重试" in line):
-                        interval_switch_suppressed_until = max(interval_switch_suppressed_until, time.time() + 90)
+                    if run_strategy == "easyproxies":
+                        if ("browser proxy precheck failed" in lower_line) or ("触发代理轮换重试" in line):
+                            interval_switch_suppressed_until = max(interval_switch_suppressed_until, time.time() + 90)
 
-                    # Avoid fighting with zhuce.py/weihu.py internal proxy rotation.
-                    script_is_rotating = ("触发代理轮换重试" in line) or ("proxy switched:" in lower_line)
-                    should_switch_now = False
-                    if not script_is_rotating:
-                        if "可重试代理异常已达最大轮换重试次数" in line:
-                            should_switch_now = True
-                        elif "proxy rotate retries reached" in lower_line:
-                            should_switch_now = True
-                    if should_switch_now:
-                        now_ts = time.time()
-                        if now_ts >= next_log_error_rotate_at:
-                            self.warn(
-                                "Detected terminal proxy/runtime error log, refreshing EasyProxies now",
-                                step=kind,
-                            )
-                            self._refresh_easyproxies_runtime(cfg, reason=f"log-error-{kind}")
-                            next_log_error_rotate_at = now_ts + log_error_rotate_cooldown_seconds
-                            if rotate_interval_seconds > 0:
-                                next_rotate_at = now_ts + rotate_interval_seconds
+                        # Avoid fighting with zhuce.py/weihu.py internal proxy rotation.
+                        script_is_rotating = ("触发代理轮换重试" in line) or ("proxy switched:" in lower_line)
+                        should_switch_now = False
+                        if not script_is_rotating:
+                            if "可重试代理异常已达最大轮换重试次数" in line:
+                                should_switch_now = True
+                            elif "proxy rotate retries reached" in lower_line:
+                                should_switch_now = True
+                        if should_switch_now:
+                            now_ts = time.time()
+                            if now_ts >= next_log_error_rotate_at:
+                                self.warn(
+                                    "Detected terminal proxy/runtime error log, refreshing EasyProxies now",
+                                    step=kind,
+                                )
+                                self._refresh_easyproxies_runtime(cfg, reason=f"log-error-{kind}")
+                                next_log_error_rotate_at = now_ts + log_error_rotate_cooldown_seconds
+                                if rotate_interval_seconds > 0:
+                                    next_rotate_at = now_ts + rotate_interval_seconds
 
                 for pattern in progress_patterns:
                     m = pattern.search(line)
