@@ -1897,6 +1897,8 @@ class RuntimeManager:
         requested_units: int,
         fixed_account: str = "",
     ) -> tuple[Dict[str, Any], int, str]:
+        if not bool(cfg.get("resin_enabled", False)):
+            raise RuntimeError("Resin is disabled")
         retry_forever = bool(cfg.get("resin_retry_forever", True))
         retry_times = max(1, min(int(cfg.get("resin_retry_times") or 3), 60))
         retry_interval = max(1, min(int(cfg.get("resin_retry_interval_seconds") or 8), 300))
@@ -1906,6 +1908,19 @@ class RuntimeManager:
             try:
                 return self._resolve_resin_proxy_for_task(cfg, kind, requested_units, fixed_account=fixed_account)
             except Exception as exc:
+                err_text = str(exc or "").strip().lower()
+                non_retryable = (
+                    "resin is disabled",
+                    "resin proxy url is empty",
+                    "resin proxy url is invalid",
+                    "resin admin token is empty",
+                    "resin api url is empty",
+                    "http 401",
+                    "http 403",
+                )
+                if any(token in err_text for token in non_retryable):
+                    self.warn(f"Resin resolve failed (non-retryable): {exc}", step="proxy")
+                    raise
                 self.warn(
                     f"Resin resolve failed: attempt={attempt}"
                     f"{'' if retry_forever else '/' + str(retry_times)} err={exc}",
@@ -3177,32 +3192,40 @@ class RuntimeManager:
                     proxy_info = self._resolve_runtime_proxy(cfg, kind="register", requested_units=target_requested)
                     rotated_node = ""
             elif proxy_engine == "resin":
-                if (
-                    not auto_triggered
-                    and fixed_node_name is not None
-                    and not requested_fixed_node
-                    and not internal_restart
-                    and bool(cfg.get("resin_node_rotation_enabled", True))
-                ):
-                    with self._lock:
-                        has_prev_rotation_identity = bool(self._resin_rotation_register_account)
-                    if has_prev_rotation_identity:
-                        self._resin_force_switch_next_account("register", reason="manual-next-register")
-                try:
-                    proxy_info, rotated_units, rotated_node = self._resolve_resin_proxy_with_retry(
-                        cfg,
-                        "register",
-                        target_requested,
-                        fixed_account=use_fixed_node,
-                    )
-                    target = max(1, int(rotated_units or target_requested))
-                except Exception as exc:
-                    self.warn(f"Resin rotation failed, fallback to runtime strategy: {exc}", step="proxy")
+                if not bool(cfg.get("resin_enabled", False)):
+                    self.warn("proxy_engine=resin but resin_enabled=false, fallback to runtime strategy", step="proxy")
                     fallback_cfg = dict(cfg)
                     fallback_cfg["resin_enabled"] = False
                     fallback_cfg["proxy_engine"] = "auto"
                     proxy_info = self._resolve_runtime_proxy(fallback_cfg, kind="register", requested_units=target_requested)
                     rotated_node = ""
+                else:
+                    if (
+                        not auto_triggered
+                        and fixed_node_name is not None
+                        and not requested_fixed_node
+                        and not internal_restart
+                        and bool(cfg.get("resin_node_rotation_enabled", True))
+                    ):
+                        with self._lock:
+                            has_prev_rotation_identity = bool(self._resin_rotation_register_account)
+                        if has_prev_rotation_identity:
+                            self._resin_force_switch_next_account("register", reason="manual-next-register")
+                    try:
+                        proxy_info, rotated_units, rotated_node = self._resolve_resin_proxy_with_retry(
+                            cfg,
+                            "register",
+                            target_requested,
+                            fixed_account=use_fixed_node,
+                        )
+                        target = max(1, int(rotated_units or target_requested))
+                    except Exception as exc:
+                        self.warn(f"Resin rotation failed, fallback to runtime strategy: {exc}", step="proxy")
+                        fallback_cfg = dict(cfg)
+                        fallback_cfg["resin_enabled"] = False
+                        fallback_cfg["proxy_engine"] = "auto"
+                        proxy_info = self._resolve_runtime_proxy(fallback_cfg, kind="register", requested_units=target_requested)
+                        rotated_node = ""
             else:
                 proxy_info = self._resolve_runtime_proxy(cfg, kind="register", requested_units=target_requested)
                 rotated_node = ""
@@ -3362,27 +3385,8 @@ class RuntimeManager:
                     )
             elif proxy_engine == "resin":
                 requested_units = maintain_limit or int(cfg.get("resin_node_maintain_quota") or 20)
-                if (
-                    not auto_triggered
-                    and fixed_node_name is not None
-                    and not requested_fixed_node
-                    and not internal_restart
-                    and bool(cfg.get("resin_node_rotation_enabled", True))
-                ):
-                    with self._lock:
-                        has_prev_rotation_identity = bool(self._resin_rotation_maintain_account)
-                    if has_prev_rotation_identity:
-                        self._resin_force_switch_next_account("maintain", reason="manual-next-maintain")
-                try:
-                    proxy_info, rotated_units, rotated_node = self._resolve_resin_proxy_with_retry(
-                        cfg,
-                        "maintain",
-                        max(1, requested_units),
-                        fixed_account=use_fixed_node,
-                    )
-                    maintain_limit = max(1, int(rotated_units or requested_units))
-                except Exception as exc:
-                    self.warn(f"Resin maintain rotation failed, fallback to runtime strategy: {exc}", step="proxy")
+                if not bool(cfg.get("resin_enabled", False)):
+                    self.warn("proxy_engine=resin but resin_enabled=false, fallback to runtime strategy", step="proxy")
                     fallback_cfg = dict(cfg)
                     fallback_cfg["resin_enabled"] = False
                     fallback_cfg["proxy_engine"] = "auto"
@@ -3392,6 +3396,37 @@ class RuntimeManager:
                         requested_units=max(1, requested_units),
                     )
                     rotated_node = ""
+                else:
+                    if (
+                        not auto_triggered
+                        and fixed_node_name is not None
+                        and not requested_fixed_node
+                        and not internal_restart
+                        and bool(cfg.get("resin_node_rotation_enabled", True))
+                    ):
+                        with self._lock:
+                            has_prev_rotation_identity = bool(self._resin_rotation_maintain_account)
+                        if has_prev_rotation_identity:
+                            self._resin_force_switch_next_account("maintain", reason="manual-next-maintain")
+                    try:
+                        proxy_info, rotated_units, rotated_node = self._resolve_resin_proxy_with_retry(
+                            cfg,
+                            "maintain",
+                            max(1, requested_units),
+                            fixed_account=use_fixed_node,
+                        )
+                        maintain_limit = max(1, int(rotated_units or requested_units))
+                    except Exception as exc:
+                        self.warn(f"Resin maintain rotation failed, fallback to runtime strategy: {exc}", step="proxy")
+                        fallback_cfg = dict(cfg)
+                        fallback_cfg["resin_enabled"] = False
+                        fallback_cfg["proxy_engine"] = "auto"
+                        proxy_info = self._resolve_runtime_proxy(
+                            fallback_cfg,
+                            kind="maintain",
+                            requested_units=max(1, requested_units),
+                        )
+                        rotated_node = ""
             else:
                 proxy_info = self._resolve_runtime_proxy(
                     cfg,
