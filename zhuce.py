@@ -17,7 +17,7 @@ from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
 from selenium.webdriver.common.keys import Keys
 from bs4 import BeautifulSoup
-from urllib.parse import urlparse, parse_qs
+from urllib.parse import parse_qs, unquote, urlparse
 from datetime import datetime, timedelta, timezone
 from concurrent.futures import ThreadPoolExecutor
 from email import policy
@@ -813,8 +813,10 @@ def _prepare_chrome_proxy_runtime(proxy_value):
         scheme = str(parsed.scheme or "http").strip().lower()
         host = str(parsed.hostname or "").strip()
         port = int(parsed.port or 0)
-        username = parsed.username or ""
-        password = parsed.password or ""
+        raw_username = parsed.username or ""
+        raw_password = parsed.password or ""
+        username = unquote(raw_username) if raw_username else ""
+        password = unquote(raw_password) if raw_password else ""
     except Exception:
         return proxy, ""
 
@@ -822,6 +824,9 @@ def _prepare_chrome_proxy_runtime(proxy_value):
         return proxy, ""
     if not username:
         return proxy, ""
+
+    if raw_username != username or raw_password != password:
+        log("检测到代理鉴权信息含 URL 编码，已自动解码后注入浏览器扩展")
 
     if scheme not in {"http", "https", "socks4", "socks5"}:
         log(f"代理协议不支持自动鉴权扩展，将按原代理参数尝试: {scheme}", "WARN")
